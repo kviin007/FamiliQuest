@@ -1,0 +1,7 @@
+{
+  "name": "FamilyQuest",
+  "description": "A gamified family task management app to turn chores into an epic adventure.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}

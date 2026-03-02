@@ -1,0 +1,23 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --color-primary: #59ca02;
+  --color-background-light: #f7f8f5;
+  --color-background-dark: #18230f;
+}
+
+@layer base {
+  body {
+    @apply font-sans bg-background-light text-slate-900;
+  }
+}
+
+.duo-shadow {
+  box-shadow: 0 4px 0 0 rgba(0,0,0,0.1);
+}
+
+.duo-border {
+  border-bottom: 4px solid rgba(0,0,0,0.1);
+}
