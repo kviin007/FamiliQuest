@@ -1,0 +1,22 @@
+{
+  "name": "Family Quest",
+  "short_name": "FamilyQuest",
+  "description": "Gestiona deberes y obligaciones familiares con recompensas y rachas.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#6366f1",
+  "icons": [
+    {
+      "src": "https://api.dicebear.com/7.x/bottts/png?seed=FamilyQuest&backgroundColor=6366f1",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "https://api.dicebear.com/7.x/bottts/png?seed=FamilyQuest&backgroundColor=6366f1&size=192",
+      "sizes": "192x192",
+      "type": "image/png"
+    }
+  ]
+}

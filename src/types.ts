@@ -5,9 +5,20 @@ export interface Alert {
   type: 'duty' | 'task' | 'general';
   date: string;
   createdBy: string;
+  recipients?: string[]; // Array of user IDs or undefined for all
 }
 
-export type View = 'login' | 'dashboard' | 'admin' | 'upload' | 'alert' | 'voting' | 'ranking' | 'settlement' | 'invitation' | 'chat' | 'pass-task' | 'confirm-payments' | 'create-task' | 'profile';
+export type View = 'login' | 'dashboard' | 'admin' | 'upload' | 'alert' | 'voting' | 'ranking' | 'settlement' | 'invitation' | 'chat' | 'pass-task' | 'confirm-payments' | 'create-task' | 'profile' | 'task-selection' | 'tutorial';
+
+export interface TaskRequest {
+  id: string;
+  userId: string;
+  taskId: string;
+  day: string;
+  slot: string;
+  status: 'pending' | 'approved' | 'rejected';
+  timestamp: string;
+}
 
 export interface Task {
   id: string;
@@ -30,6 +41,27 @@ export interface Task {
     vote: 'good' | 'bad';
   }[];
   penaltyMultiplier?: number; // 1 by default, 2 for double penalty
+  passCost?: number; // Custom value to pass the task to another user
+}
+
+export interface PersonalDuty {
+  id: string;
+  title: string;
+  description?: string;
+  reminderType: 'daily' | 'weekly' | 'monthly' | 'annual' | 'once';
+  dueDate?: string;
+  completed: boolean;
+  alarmEnabled: boolean;
+}
+
+export interface FamilyGoal {
+  id: string;
+  title: string;
+  targetValue: number;
+  currentValue: number;
+  type: 'tasks_completed' | 'xp_earned' | 'debt_reduced';
+  period: 'weekly' | 'monthly';
+  deadline: string;
 }
 
 export interface Member {
@@ -42,16 +74,22 @@ export interface Member {
   xp: number;
   hearts: number;
   streak: number;
-  debt: number; // Weekly debt (starts negative)
+  debt: number; // Weekly debt
+  monthlyDebt: number; // Monthly accumulated debt
   avatar: string;
   progress: number;
+  birthday?: string;
+  personalDuties?: PersonalDuty[];
   paymentInfo?: {
     type: 'nequi' | 'bancolombia';
     number: string;
   };
   availability?: Record<string, string[]>; // e.g., { 'Monday': ['Morning', 'Afternoon'] }
+  isOnline?: boolean;
+  lastSeen?: string;
   settings?: {
     darkMode: boolean;
+    hasSeenTutorial?: boolean;
   };
 }
 

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   Home, 
   BarChart2, 
@@ -15,6 +15,7 @@ import {
   Plus, 
   ChevronRight,
   Camera,
+  Image as ImageIcon,
   AlertTriangle,
   MessageCircle,
   Shield,
@@ -46,7 +47,7 @@ import {
   Droplets
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { View, Task, Member, Payment, Alert, ChatMessage, Appeal } from './types';
+import { View, Task, Member, Payment, Alert, ChatMessage, Appeal, TaskRequest } from './types';
 import { INITIAL_TASKS, MEMBERS } from './constants';
 
 const IconMap: Record<string, any> = {
@@ -73,16 +74,26 @@ const IconMap: Record<string, any> = {
 
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [user, setUser] = useState<Member>(MEMBERS[0]);
+  const userRef = useRef<Member | null>(null);
+
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
+
   const [currentView, setCurrentView] = useState<View>('login');
   const [tasks, setTasks] = useState<Task[]>(INITIAL_TASKS);
   const [members, setMembers] = useState<Member[]>(MEMBERS);
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [user, setUser] = useState<Member>(MEMBERS[0]);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
+  const [showTutorial, setShowTutorial] = useState(false);
+  const [tutorialStep, setTutorialStep] = useState(0);
   const [messages, setMessages] = useState<ChatMessage[]>([
     { id: '1', userId: 'admin', userName: 'Admin', userAvatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Admin', text: '¡Bienvenidos al chat familiar! Recuerden completar sus tareas antes del domingo.', timestamp: new Date().toISOString(), isAdminAlert: true },
   ]);
   const [appeals, setAppeals] = useState<Appeal[]>([]);
+  const [taskRequests, setTaskRequests] = useState<TaskRequest[]>([]);
   const [payments, setPayments] = useState<Payment[]>([
     { id: '1', userId: 'styven', userName: 'Styven', amount: 5000, date: new Date().toISOString(), status: 'pending', type: 'fine' },
     { id: '2', userId: 'isabella', userName: 'Isabella', amount: 2000, date: new Date().toISOString(), status: 'pending', type: 'fine' },
@@ -93,6 +104,209 @@ export default function App() {
     number: '3024468046',
     owner: 'Admin'
   });
+
+  const ws = useRef<WebSocket | null>(null);
+
+  // Fetch initial state
+  useEffect(() => {
+    const fetchState = async () => {
+      try {
+        const res = await fetch('/api/state');
+        const data = await res.json();
+        setMembers(data.members);
+        setTasks(data.tasks);
+        setAlerts(data.alerts);
+        setMessages(data.messages);
+        const reqRes = await fetch('/api/task-requests');
+        const reqData = await reqRes.json();
+        setTaskRequests(reqData);
+      } catch (err) {
+        console.error("Failed to fetch state", err);
+      }
+    };
+    fetchState();
+    requestPermissions();
+
+    // WebSocket connection
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(`${protocol}//${window.location.host}`);
+    ws.current = socket;
+
+    socket.onopen = () => {
+      setIsConnected(true);
+      if (userRef.current && isLoggedIn) {
+        socket.send(JSON.stringify({ type: 'IDENTIFY', userId: userRef.current.id }));
+      }
+    };
+    socket.onclose = () => setIsConnected(false);
+
+    socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      switch (data.type) {
+        case 'TASK_UPDATED':
+          setTasks(prev => {
+            const exists = prev.find(t => t.id === data.task.id);
+            if (exists) return prev.map(t => t.id === data.task.id ? data.task : t);
+            return [data.task, ...prev];
+          });
+          break;
+        case 'TASK_DELETED':
+          setTasks(prev => prev.filter(t => t.id !== data.taskId));
+          break;
+        case 'MEMBER_UPDATED':
+          setMembers(prev => prev.map(m => m.id === data.member.id ? data.member : m));
+          if (userRef.current && userRef.current.id === data.member.id) setUser(data.member);
+          break;
+        case 'ALERT_ADDED':
+          setAlerts(prev => [data.alert, ...prev]);
+          break;
+        case 'MESSAGE_ADDED':
+          setMessages(prev => [...prev, data.message]);
+          break;
+        case 'USER_ONLINE':
+          setMembers(prev => prev.map(m => m.id === data.userId ? { ...m, isOnline: true } : m));
+          break;
+        case 'USER_OFFLINE':
+          setMembers(prev => prev.map(m => m.id === data.userId ? { ...m, isOnline: false } : m));
+          break;
+        case 'MEMBER_DELETED':
+          setMembers(prev => prev.filter(m => m.id !== data.userId));
+          if (userRef.current && userRef.current.id === data.userId) {
+            setUser(null);
+            setIsLoggedIn(false);
+            setCurrentView('login');
+          }
+          break;
+        case 'TASK_REQUEST_UPDATED':
+          setTaskRequests(prev => {
+            const exists = prev.find(r => r.id === data.request.id);
+            if (exists) return prev.map(r => r.id === data.request.id ? data.request : r);
+            return [data.request, ...prev];
+          });
+          break;
+        case 'TASK_REQUEST_DELETED':
+          setTaskRequests(prev => prev.filter(r => r.id !== data.requestId));
+          break;
+        case 'LOG_ADDED':
+          // Logs are fetched on demand in admin view, but we could update state if we had it
+          break;
+      }
+    };
+
+    return () => socket.close();
+  }, []);
+
+  const syncTask = async (task: Task) => {
+    await fetch('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(task)
+    });
+  };
+
+  const syncTaskRequest = async (request: TaskRequest) => {
+    await fetch('/api/task-requests', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    });
+  };
+
+  const deleteRequest = async (id: string) => {
+    await fetch(`/api/task-requests/${id}`, { method: 'DELETE' });
+  };
+
+  const syncMember = async (member: Member) => {
+    await fetch('/api/members', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(member)
+    });
+  };
+
+  const syncAlert = async (alert: Alert) => {
+    await fetch('/api/alerts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(alert)
+    });
+    logAction('ALERT_CREATED', `Alerta creada: ${alert.title}`);
+  };
+
+  const logAction = async (action: string, details: string, userId?: string, userName?: string) => {
+    const id = userId || user?.id;
+    const name = userName || user?.name;
+    if (!id) return;
+    await fetch('/api/logs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: id,
+        userName: name,
+        action,
+        details,
+        timestamp: new Date().toISOString()
+      })
+    });
+  };
+
+  const checkDeadlines = useCallback(() => {
+    if (!userRef.current) return;
+    const now = new Date();
+    
+    tasks.forEach(task => {
+      if (task.status === 'pending' && task.assignedTo === userRef.current?.id) {
+        const dueDate = new Date(task.dueDate || '');
+        const diffTime = now.getTime() - dueDate.getTime();
+        const diffDays = diffTime / (1000 * 60 * 60 * 24);
+        
+        // Obligations: 1 day deadline
+        // Duties: 7 days deadline
+        const isExpired = (task.taskType === 'obligation' && diffDays > 1) || 
+                          (task.taskType === 'duty' && diffDays > 7);
+        
+        if (isExpired) {
+          // Apply penalty
+          const penalty = task.fine || (task.value * 2);
+          const updatedUser = { 
+            ...userRef.current!, 
+            debt: userRef.current!.debt - penalty,
+            monthlyDebt: (userRef.current!.monthlyDebt || 0) - penalty
+          };
+          const updatedTask = { ...task, status: 'failed' as const };
+          
+          syncTask(updatedTask);
+          syncMember(updatedUser);
+          logAction('TASK_EXPIRED', `Tarea expirada: ${task.title}. Penalidad aplicada: $${penalty}`);
+          alert(`La tarea "${task.title}" ha expirado. Se ha aplicado una penalidad de $${penalty}.`);
+        }
+      }
+    });
+  }, [tasks, syncTask, syncMember, logAction]);
+
+  const requestPermissions = async () => {
+    try {
+      await navigator.mediaDevices.getUserMedia({ video: true });
+      console.log("Camera permission granted");
+    } catch (err) {
+      console.warn("Camera permission denied or not available", err);
+    }
+  };
+
+  useEffect(() => {
+    if (isLoggedIn) {
+      checkDeadlines();
+      requestPermissions();
+    }
+  }, [isLoggedIn, checkDeadlines]);
+
+  const syncMessage = async (msg: ChatMessage) => {
+    await fetch('/api/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(msg)
+    });
+  };
 
   // Weekly cleanup of images
   React.useEffect(() => {
@@ -111,29 +325,74 @@ export default function App() {
 
   const isDarkMode = user.settings?.darkMode || false;
 
-  const handleLogin = (email: string, pass: string) => {
-    const foundUser = members.find(m => m.email === email && m.password === pass);
-    if (foundUser) {
-      setUser(foundUser);
-      setIsLoggedIn(true);
-      setCurrentView('dashboard');
-    } else {
-      alert('Credenciales incorrectas');
+  const handleLogin = async (email: string, pass: string) => {
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password: pass })
+      });
+      if (res.ok) {
+        const foundUser = await res.json();
+        setUser(foundUser);
+        setIsLoggedIn(true);
+        setCurrentView('dashboard');
+        logAction('LOGIN', `Usuario inició sesión: ${foundUser.name}`, foundUser.id, foundUser.name);
+        
+        // Identify on login if socket is open
+        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+          ws.current.send(JSON.stringify({ type: 'IDENTIFY', userId: foundUser.id }));
+        }
+
+        // Show tutorial if first time
+        if (!foundUser.settings?.hasSeenTutorial) {
+          setShowTutorial(true);
+          setTutorialStep(0);
+        }
+      } else {
+        alert('Credenciales incorrectas');
+      }
+    } catch (err) {
+      alert('Error al conectar con el servidor');
     }
   };
 
-  const handleLogout = () => {
-    setIsLoggedIn(false);
-    setCurrentView('login');
+  const handleLogout = async () => {
+    if (user) {
+      logAction('LOGOUT', 'Usuario cerró sesión');
+      await fetch('/api/logout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: user.id })
+      });
+      
+      // Close socket to trigger offline status
+      if (ws.current) {
+        ws.current.close();
+      }
+      
+      setIsLoggedIn(false);
+      setUser(MEMBERS[0]);
+      setCurrentView('login');
+    }
   };
 
   const handleUpdateUser = (updatedUser: Member) => {
     setUser(updatedUser);
-    setMembers(prev => prev.map(m => m.id === updatedUser.id ? updatedUser : m));
+    syncMember(updatedUser);
+    logAction('USER_UPDATED', `Usuario actualizado: ${updatedUser.name}`);
   };
 
   const handleCreateUser = (newUser: Member) => {
-    setMembers(prev => [...prev, newUser]);
+    syncMember(newUser);
+    logAction('USER_CREATED', `Usuario creado: ${newUser.name}`);
+  };
+
+  const handleDeleteUser = async (userId: string) => {
+    if (confirm('¿Estás seguro de eliminar a este usuario?')) {
+      await fetch(`/api/members/${userId}`, { method: 'DELETE' });
+      logAction('USER_DELETED', `Usuario eliminado: ${userId}`);
+    }
   };
 
   const handleApprovePayment = (paymentId: string) => {
@@ -151,98 +410,146 @@ export default function App() {
 
   const handleCompleteTask = (taskId: string, proof?: string) => {
     const now = new Date().toISOString();
-    setTasks(prev => prev.map(t => {
-      if (t.id === taskId) {
-        return { ...t, status: 'completed', imageUrl: proof, completedAt: now };
-      }
-      return t;
-    }));
+    const task = tasks.find(t => t.id === taskId);
+    if (task) {
+      const updatedTask = { ...task, status: 'completed' as const, imageUrl: proof, completedAt: now };
+      syncTask(updatedTask);
+      logAction('TASK_COMPLETED', `Tarea completada: ${task.title}`);
+    }
     setCurrentView('dashboard');
   };
 
   const handleStartVoting = (taskId: string) => {
-    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, isVotingActive: true, votes: [] } : t));
-    alert('Votación iniciada para esta tarea.');
+    const task = tasks.find(t => t.id === taskId);
+    if (task) {
+      const updatedTask = { ...task, isVotingActive: true, votes: [] };
+      syncTask(updatedTask);
+      logAction('VOTING_STARTED', `Votación iniciada: ${task.title}`);
+      alert('Votación iniciada para esta tarea.');
+    }
   };
 
   const handleCastVote = (taskId: string, userId: string, vote: 'good' | 'bad') => {
-    setTasks(prev => prev.map(t => {
-      if (t.id === taskId) {
-        const existingVotes = t.votes || [];
-        const filteredVotes = existingVotes.filter(v => v.userId !== userId);
-        return { ...t, votes: [...filteredVotes, { userId, vote }] };
-      }
-      return t;
-    }));
+    const task = tasks.find(t => t.id === taskId);
+    if (task) {
+      const existingVotes = task.votes || [];
+      const filteredVotes = existingVotes.filter(v => v.userId !== userId);
+      const updatedTask = { ...task, votes: [...filteredVotes, { userId, vote }] };
+      syncTask(updatedTask);
+    }
   };
 
-  const handleValidateTask = (taskId: string, approved: boolean, customDebtChange?: number) => {
-    setTasks(prev => {
-      const task = prev.find(t => t.id === taskId);
-      if (!task) return prev;
+  const handleValidateTask = async (taskId: string, approved: boolean, customDebtChange?: number) => {
+    const task = tasks.find(t => t.id === taskId);
+    if (!task) return;
 
-      let nextTasks = prev.map(t => {
-        if (t.id === taskId) {
-          return { ...t, status: (approved ? 'validated' : 'failed') as any, isVotingActive: false };
-        }
-        return t;
-      });
+    const updatedTask = { ...task, status: (approved ? 'validated' : 'failed') as any, isVotingActive: false };
+    await syncTask(updatedTask);
+    logAction('TASK_VALIDATED', `Tarea ${approved ? 'aprobada' : 'rechazada'}: ${task.title}`);
 
-      if (approved) {
+    if (approved) {
+      const userId = task.assignedTo;
+      const member = members.find(m => m.id === userId);
+      if (member) {
+        const debtChange = customDebtChange !== undefined ? customDebtChange : (task.value || 0);
+        const updatedMember = {
+          ...member,
+          debt: member.debt + debtChange,
+          monthlyDebt: (member.monthlyDebt || 0) + debtChange,
+          xp: member.xp + task.xp,
+          progress: Math.min(100, member.progress + 5)
+        };
+        syncMember(updatedMember);
+      }
+    } else {
+      // Penalty logic
+      const badVotes = task.votes?.filter(v => v.vote === 'bad').length || 0;
+      const goodVotes = task.votes?.filter(v => v.vote === 'good').length || 0;
+      
+      if (task.isVotingActive && badVotes > goodVotes) {
         const userId = task.assignedTo;
         if (userId) {
-          setMembers(mems => mems.map(m => {
-            if (m.id === userId) {
-              const debtChange = customDebtChange !== undefined ? customDebtChange : (task.value || 0);
-              return { 
-                ...m, 
-                debt: m.debt + debtChange,
-                xp: m.xp + task.xp,
-                progress: Math.min(100, m.progress + 5)
-              };
-            }
-            return m;
-          }));
-        }
-      } else {
-        // Penalty logic
-        const badVotes = task.votes?.filter(v => v.vote === 'bad').length || 0;
-        const goodVotes = task.votes?.filter(v => v.vote === 'good').length || 0;
-        
-        if (task.isVotingActive && badVotes > goodVotes) {
-          const userId = task.assignedTo;
-          if (userId) {
-            const penaltyTask1: Task = {
-              ...task,
-              id: `penalty-1-${Date.now()}`,
-              title: `[PENALIDAD] ${task.title} (1/2)`,
-              status: 'pending',
-              taskType: 'obligation',
-              penaltyMultiplier: 2,
-              isVotingActive: false,
-              votes: [],
-              imageUrl: undefined,
-              completedAt: undefined
-            };
-            const penaltyTask2: Task = {
-              ...task,
-              id: `penalty-2-${Date.now()}`,
-              title: `[PENALIDAD] ${task.title} (2/2)`,
-              status: 'pending',
-              taskType: 'obligation',
-              penaltyMultiplier: 2,
-              isVotingActive: false,
-              votes: [],
-              imageUrl: undefined,
-              completedAt: undefined
-            };
-            nextTasks.push(penaltyTask1, penaltyTask2);
-            alert('La mayoría votó "Mal Ejecutado". Se han asignado 2 obligaciones de penalidad con costo doble.');
-          }
+          const penaltyTask1: Task = {
+            ...task,
+            id: `penalty-1-${Date.now()}`,
+            title: `[PENALIDAD] ${task.title} (1/2)`,
+            status: 'pending',
+            taskType: 'obligation',
+            penaltyMultiplier: 2,
+            isVotingActive: false,
+            votes: [],
+            imageUrl: undefined,
+            completedAt: undefined
+          };
+          const penaltyTask2: Task = {
+            ...task,
+            id: `penalty-2-${Date.now()}`,
+            title: `[PENALIDAD] ${task.title} (2/2)`,
+            status: 'pending',
+            taskType: 'obligation',
+            penaltyMultiplier: 2,
+            isVotingActive: false,
+            votes: [],
+            imageUrl: undefined,
+            completedAt: undefined
+          };
+          await syncTask(penaltyTask1);
+          await syncTask(penaltyTask2);
+          alert('La mayoría votó "Mal Ejecutado". Se han asignado 2 obligaciones de penalidad con costo doble.');
         }
       }
-      return nextTasks;
-    });
+    }
+  };
+
+  const handleApproveRequest = async (request: TaskRequest) => {
+    const templateTask = tasks.find(t => t.id === request.taskId);
+    if (!templateTask) return;
+
+    // Create a new task instance for the user
+    const newTask: Task = {
+      ...templateTask,
+      id: Math.random().toString(36).substring(7),
+      assignedTo: request.userId,
+      status: 'pending',
+      dueDate: getNextOccurrence(request.day, request.slot),
+      isVotingActive: false,
+      votes: [],
+      imageUrl: undefined,
+      completedAt: undefined
+    };
+
+    await syncTask(newTask);
+    await syncTaskRequest({ ...request, status: 'approved' });
+    logAction('TASK_REQUEST_APPROVED', `Solicitud de "${templateTask.title}" aprobada para ${request.userId}`);
+    alert('Solicitud aprobada');
+  };
+
+  const handleRejectRequest = async (requestId: string) => {
+    const request = taskRequests.find(r => r.id === requestId);
+    if (request) {
+      await syncTaskRequest({ ...request, status: 'rejected' });
+      logAction('TASK_REQUEST_REJECTED', `Solicitud rechazada para ${request.userId}`);
+      alert('Solicitud rechazada');
+    }
+  };
+
+  const getNextOccurrence = (dayName: string, slot: string) => {
+    const days = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+    const targetDay = days.indexOf(dayName);
+    const now = new Date();
+    const currentDay = now.getDay();
+    let diff = targetDay - currentDay;
+    if (diff < 0) diff += 7;
+    
+    const nextDate = new Date();
+    nextDate.setDate(now.getDate() + diff);
+    
+    // Set time based on slot
+    if (slot === 'Mañana') nextDate.setHours(9, 0, 0, 0);
+    else if (slot === 'Tarde') nextDate.setHours(15, 0, 0, 0);
+    else nextDate.setHours(21, 0, 0, 0);
+    
+    return nextDate.toISOString();
   };
 
   const filteredTasks = tasks.filter(t => !t.assignedTo || t.assignedTo === user.id);
@@ -256,7 +563,7 @@ export default function App() {
       case 'login':
         return <LoginScreen onLogin={handleLogin} darkMode={isDarkMode} />;
       case 'dashboard':
-        return <Dashboard tasks={filteredTasks} user={user} setView={setCurrentView} onPassTask={handlePassTask} onCompleteDuty={(id) => {
+        return <Dashboard tasks={filteredTasks} user={user} members={members} setView={setCurrentView} onPassTask={handlePassTask} isConnected={isConnected} onCompleteDuty={(id) => {
           const task = tasks.find(t => t.id === id);
           if (task) {
             if (task.taskType === 'duty') {
@@ -276,28 +583,38 @@ export default function App() {
             onApprovePayment={handleApprovePayment}
             onRejectPayment={handleRejectPayment}
             onCreateUser={handleCreateUser}
+            onDeleteUser={handleDeleteUser}
             onUpdateUser={handleUpdateUser}
             onValidateTask={handleValidateTask}
             onStartVoting={handleStartVoting}
-            onAddAlert={(a) => setAlerts(prev => [a, ...prev])}
+            onAddAlert={(a) => syncAlert(a)}
             onAssignTask={(taskId, userId) => {
-              setTasks(prev => prev.map(t => t.id === taskId ? { ...t, assignedTo: userId } : t));
-              alert(`Tarea asignada con éxito`);
+              const task = tasks.find(t => t.id === taskId);
+              if (task) {
+                const updatedTask = { ...task, assignedTo: userId };
+                syncTask(updatedTask);
+                logAction('TASK_ASSIGNED', `Tarea "${task.title}" asignada a ${userId}`);
+                alert(`Tarea asignada con éxito`);
+              }
             }}
-            onDeleteTask={(taskId) => {
-              setTasks(prev => prev.filter(t => t.id !== taskId));
+            onDeleteTask={async (taskId) => {
+              await fetch(`/api/tasks/${taskId}`, { method: 'DELETE' });
+              logAction('TASK_DELETED', `Tarea eliminada: ${taskId}`);
               alert('Tarea eliminada');
             }}
             setView={setCurrentView} 
             currentUser={user}
             paymentConfig={paymentConfig}
             onUpdatePaymentConfig={setPaymentConfig}
+            taskRequests={taskRequests}
+            onApproveRequest={handleApproveRequest}
+            onRejectRequest={handleRejectRequest}
           />
         );
       case 'upload':
         return <UploadEvidence task={selectedTask} setView={setCurrentView} onComplete={(proof) => handleCompleteTask(selectedTask?.id || '', proof)} />;
       case 'alert':
-        return <AlertScreen alerts={alerts} setView={setCurrentView} user={user} onAddAlert={(a) => setAlerts(prev => [a, ...prev])} />;
+        return <AlertScreen alerts={alerts} setView={setCurrentView} user={user} onAddAlert={(a) => syncAlert(a)} members={members} />;
       case 'voting':
         return <VotingScreen setView={setCurrentView} tasks={tasks} members={members} user={user} onCastVote={handleCastVote} />;
       case 'ranking':
@@ -307,40 +624,84 @@ export default function App() {
       case 'invitation':
         return <InvitationScreen setView={setCurrentView} />;
       case 'chat':
-        return <ChatScreen messages={messages} user={user} setView={setCurrentView} onSendMessage={(msg) => setMessages(prev => [...prev, msg])} onDeleteMessage={(id) => setMessages(prev => prev.filter(m => m.id !== id))} />;
+        return <ChatScreen messages={messages} user={user} setView={setCurrentView} onSendMessage={(msg) => setMessages(prev => [...prev, msg])} onDeleteMessage={(id) => setMessages(prev => prev.filter(m => m.id !== id))} syncMessage={syncMessage} />;
+      case 'tutorial':
+        return <TutorialView setView={setCurrentView} />;
       case 'profile':
         return <ProfileScreen user={user} onUpdateUser={handleUpdateUser} setView={setCurrentView} onLogout={handleLogout} currentUser={user} />;
+      case 'task-selection':
+        return <TaskSelectionScreen tasks={tasks} user={user} taskRequests={taskRequests} onAddRequest={syncTaskRequest} setView={setCurrentView} />;
       case 'pass-task':
-        return <PassTaskScreen task={selectedTask} setView={setCurrentView} />;
+        return <PassTaskScreen task={selectedTask} members={members} user={user} setView={setCurrentView} onPass={(taskId, toUserId, fine) => {
+          const task = tasks.find(t => t.id === taskId);
+          const fromUser = user;
+          const toUser = members.find(m => m.id === toUserId);
+          if (task && toUser) {
+            const updatedTask = { ...task, assignedTo: toUserId };
+            const updatedFromUser = { ...fromUser, debt: fromUser.debt - fine, monthlyDebt: (fromUser.monthlyDebt || 0) - fine };
+            const updatedToUser = { ...toUser, debt: toUser.debt + fine, monthlyDebt: (toUser.monthlyDebt || 0) + fine };
+            syncTask(updatedTask);
+            syncMember(updatedFromUser);
+            syncMember(updatedToUser);
+            alert('Traspaso completado');
+            setCurrentView('dashboard');
+          }
+        }} />;
       case 'confirm-payments':
         return <ConfirmPayments setView={setCurrentView} />;
       case 'create-task':
         return <CreateTaskScreen members={members} setView={setCurrentView} onSave={(newTask, repeatDays) => {
           if (repeatDays) {
-            const newTasks: Task[] = [];
             for (let i = 0; i < 7; i++) {
-              const date = new Date('2026-03-02T10:15:28-08:00');
+              const date = new Date();
               date.setDate(date.getDate() + i);
               const dayName = date.toLocaleDateString('es-ES', { day: 'numeric', month: 'long', year: 'numeric' });
-              newTasks.push({
+              const t = {
                 ...newTask,
                 id: Math.random().toString(36).substring(7),
                 title: `${newTask.title} ${dayName}`,
                 dueDate: date.toISOString()
-              });
+              };
+              syncTask(t);
             }
-            setTasks(prev => [...newTasks, ...prev]);
           } else {
-            setTasks(prev => [newTask, ...prev]);
+            syncTask(newTask);
           }
         }} darkMode={isDarkMode} />;
       default:
-        return <Dashboard tasks={tasks} user={user} setView={setCurrentView} onPassTask={handlePassTask} onCompleteDuty={(id) => handleCompleteTask(id)} isDarkMode={isDarkMode} />;
+        return <Dashboard tasks={tasks} user={user} members={members} setView={setCurrentView} onPassTask={handlePassTask} onCompleteDuty={(id) => handleCompleteTask(id)} isDarkMode={isDarkMode} isConnected={isConnected} />;
     }
   };
 
   return (
-    <div className={`max-w-md mx-auto min-h-screen flex flex-col relative overflow-hidden transition-colors duration-300 ${isDarkMode ? 'bg-slate-900 text-white' : 'bg-white text-slate-900'} shadow-2xl`}>
+    <>
+      {/* Welcome Tutorial Overlay */}
+      <AnimatePresence>
+        {showTutorial && (
+          <WelcomeTutorial 
+            step={tutorialStep} 
+            onNext={() => setTutorialStep(prev => prev + 1)} 
+            onSkip={() => {
+              setShowTutorial(false);
+              const updatedUser = { 
+                ...user, 
+                settings: { ...user.settings, hasSeenTutorial: true, darkMode: user.settings?.darkMode || false } 
+              };
+              syncMember(updatedUser);
+            }}
+            onFinish={() => {
+              setShowTutorial(false);
+              const updatedUser = { 
+                ...user, 
+                settings: { ...user.settings, hasSeenTutorial: true, darkMode: user.settings?.darkMode || false } 
+              };
+              syncMember(updatedUser);
+            }}
+          />
+        )}
+      </AnimatePresence>
+
+      <div className={`max-w-md mx-auto min-h-screen flex flex-col relative overflow-hidden transition-colors duration-300 ${isDarkMode ? 'bg-slate-900 text-white' : 'bg-white text-slate-900'} shadow-2xl`}>
       <AnimatePresence mode="wait">
         <motion.div
           key={currentView}
@@ -403,6 +764,7 @@ export default function App() {
         </nav>
       )}
     </div>
+    </>
   );
 }
 
@@ -461,6 +823,149 @@ function ZoomableImage({ src, alt, className }: { src: string, alt: string, clas
         )}
       </AnimatePresence>
     </>
+  );
+}
+
+function TaskSelectionScreen({ tasks, user, taskRequests, onAddRequest, setView }: { tasks: Task[], user: Member, taskRequests: TaskRequest[], onAddRequest: (r: TaskRequest) => void, setView: (v: View) => void }) {
+  const [selectedDay, setSelectedDay] = useState('Lunes');
+  const [selectedSlot, setSelectedSlot] = useState('Mañana');
+  const days = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
+  const slots = ['Mañana', 'Tarde', 'Noche'];
+  const isDarkMode = user.settings?.darkMode;
+
+  // Available tasks are those not assigned to anyone
+  const availableTasks = tasks.filter(t => !t.assignedTo);
+  
+  const myRequests = taskRequests.filter(r => r.userId === user.id);
+  const requestsForSelectedDay = myRequests.filter(r => r.day === selectedDay);
+
+  const handleRequest = (task: Task) => {
+    // Limits check
+    const dutiesCount = requestsForSelectedDay.filter(r => {
+      const t = tasks.find(tk => tk.id === r.taskId);
+      return t?.taskType === 'duty';
+    }).length;
+    const obligationsCount = requestsForSelectedDay.filter(r => {
+      const t = tasks.find(tk => tk.id === r.taskId);
+      return t?.taskType === 'obligation';
+    }).length;
+
+    if (task.taskType === 'duty' && dutiesCount >= 5) {
+      alert('Límite de 5 deberes por día alcanzado');
+      return;
+    }
+    if (task.taskType === 'obligation' && obligationsCount >= 2) {
+      alert('Límite de 2 obligaciones por día alcanzado');
+      return;
+    }
+
+    const newRequest: TaskRequest = {
+      id: Math.random().toString(36).substring(7),
+      userId: user.id,
+      taskId: task.id,
+      day: selectedDay,
+      slot: selectedSlot,
+      status: 'pending',
+      timestamp: new Date().toISOString()
+    };
+    onAddRequest(newRequest);
+    alert('Solicitud enviada al administrador');
+  };
+
+  return (
+    <div className="flex-1 flex flex-col h-full overflow-hidden">
+      <header className={`p-4 border-b-2 flex items-center justify-between transition-colors duration-300 ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-100'}`}>
+        <div className="flex items-center gap-4">
+          <button onClick={() => setView('dashboard')} className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800"><X /></button>
+          <h1 className="font-bold text-lg">Solicitar Tareas</h1>
+        </div>
+      </header>
+
+      <main className="flex-1 p-6 space-y-6 overflow-y-auto">
+        <section className="space-y-3">
+          <h3 className="font-black text-xs uppercase tracking-widest text-slate-400 px-1">1. Selecciona el Día</h3>
+          <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-hide">
+            {days.map(day => (
+              <button
+                key={day}
+                onClick={() => setSelectedDay(day)}
+                className={`shrink-0 px-4 py-2 rounded-xl font-bold text-xs transition-all ${selectedDay === day ? 'bg-primary text-white shadow-lg shadow-primary/20' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}
+              >
+                {day}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="space-y-3">
+          <h3 className="font-black text-xs uppercase tracking-widest text-slate-400 px-1">2. Selecciona el Horario</h3>
+          <div className="flex gap-2">
+            {slots.map(slot => (
+              <button
+                key={slot}
+                onClick={() => setSelectedSlot(slot)}
+                className={`flex-1 py-2 rounded-xl font-bold text-xs transition-all ${selectedSlot === slot ? 'bg-primary text-white shadow-lg shadow-primary/20' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}
+              >
+                {slot}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="space-y-4">
+          <h3 className="font-black text-xs uppercase tracking-widest text-slate-400 px-1">3. Elige tus Misiones</h3>
+          <div className="space-y-3">
+            {availableTasks.map(task => {
+              const Icon = IconMap[task.icon] || Utensils;
+              const isRequested = myRequests.some(r => r.taskId === task.id && r.day === selectedDay && r.slot === selectedSlot);
+              
+              return (
+                <div key={task.id} className={`p-4 rounded-2xl border-2 duo-shadow flex items-center gap-4 transition-all ${isRequested ? 'opacity-50 grayscale' : (isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-100')}`}>
+                  <div className={`size-12 rounded-xl flex items-center justify-center ${task.taskType === 'obligation' ? 'bg-amber-100 text-amber-600' : 'bg-blue-100 text-blue-600'}`}>
+                    <Icon size={24} />
+                  </div>
+                  <div className="flex-1">
+                    <p className="font-bold text-sm">{task.title}</p>
+                    <p className="text-[10px] text-slate-500 uppercase font-black tracking-widest">
+                      {task.taskType === 'obligation' ? 'Obligación' : 'Deber'} • {task.xp} XP
+                    </p>
+                  </div>
+                  <button 
+                    disabled={isRequested}
+                    onClick={() => handleRequest(task)}
+                    className={`p-2 rounded-lg transition-all ${isRequested ? 'bg-slate-200 text-slate-400' : 'bg-primary text-white shadow-lg shadow-primary/20'}`}
+                  >
+                    {isRequested ? <Check size={18} /> : <Plus size={18} />}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
+        {myRequests.length > 0 && (
+          <section className="space-y-4 pt-4 border-t-2 border-slate-100 dark:border-slate-800">
+            <h3 className="font-black text-xs uppercase tracking-widest text-slate-400 px-1">Tus Solicitudes Pendientes</h3>
+            <div className="space-y-2">
+              {myRequests.map(req => {
+                const task = tasks.find(t => t.id === req.taskId);
+                return (
+                  <div key={req.id} className="flex items-center justify-between p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border-2 border-slate-100 dark:border-slate-700">
+                    <div>
+                      <p className="font-bold text-xs">{task?.title}</p>
+                      <p className="text-[8px] font-black uppercase text-slate-400">{req.day} • {req.slot}</p>
+                    </div>
+                    <span className={`text-[8px] font-black uppercase px-2 py-1 rounded-full ${req.status === 'pending' ? 'bg-amber-100 text-amber-600' : req.status === 'approved' ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600'}`}>
+                      {req.status === 'pending' ? 'Pendiente' : req.status === 'approved' ? 'Aprobado' : 'Rechazado'}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
+      </main>
+    </div>
   );
 }
 
@@ -530,10 +1035,35 @@ function ConfirmationModal({
 
 // --- Views ---
 
-function Dashboard({ tasks, user, setView, onPassTask, onCompleteDuty, isDarkMode }: { tasks: Task[], user: Member, setView: (v: View) => void, onPassTask: (t: Task) => void, onCompleteDuty: (id: string) => void, isDarkMode: boolean }) {
+function Dashboard({ tasks, user, members, setView, onPassTask, onCompleteDuty, isDarkMode, isConnected }: { tasks: Task[], user: Member, members: Member[], setView: (v: View) => void, onPassTask: (t: Task) => void, onCompleteDuty: (id: string) => void, isDarkMode: boolean, isConnected: boolean }) {
   const [sortBy, setSortBy] = useState<'xp' | 'dueDate' | 'category'>('dueDate');
+  const [selectedDay, setSelectedDay] = useState<string>(new Date().toLocaleDateString('es-ES', { weekday: 'long' }).charAt(0).toUpperCase() + new Date().toLocaleDateString('es-ES', { weekday: 'long' }).slice(1));
 
-  const sortedTasks = [...tasks].sort((a, b) => {
+  const dayNames = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
+
+  const onlineMembers = members.filter(m => m.isOnline && m.id !== user.id);
+  const admins = members.filter(m => m.role === 'admin');
+
+  // Daily limits check for the selected day
+  const filteredByDayTasks = tasks.filter(t => {
+    if (t.assignedTo !== user.id) return false;
+    if (!t.dueDate) return true;
+    const taskDate = new Date(t.dueDate);
+    const taskDayName = taskDate.toLocaleDateString('es-ES', { weekday: 'long' }).charAt(0).toUpperCase() + taskDate.toLocaleDateString('es-ES', { weekday: 'long' }).slice(1);
+    return taskDayName === selectedDay;
+  });
+
+  const completedTasksOnSelectedDay = filteredByDayTasks.filter(t => 
+    (t.status === 'completed' || t.status === 'validated')
+  );
+
+  const todaysObligations = completedTasksOnSelectedDay.filter(t => t.taskType === 'obligation').length;
+  const todaysDuties = completedTasksOnSelectedDay.filter(t => t.taskType === 'duty').length;
+
+  const canCompleteObligation = todaysObligations < 2;
+  const canCompleteDuty = todaysDuties < 5;
+
+  const sortedTasks = [...filteredByDayTasks].sort((a, b) => {
     if (sortBy === 'xp') return b.xp - a.xp;
     if (sortBy === 'category') return a.category.localeCompare(b.category);
     if (sortBy === 'dueDate') {
@@ -544,10 +1074,10 @@ function Dashboard({ tasks, user, setView, onPassTask, onCompleteDuty, isDarkMod
     return 0;
   });
 
-  const completedDuties = tasks.filter(t => t.taskType === 'duty' && (t.status === 'completed' || t.status === 'validated')).length;
-  const totalDuties = tasks.filter(t => t.taskType === 'duty').length;
-  const completedObligations = tasks.filter(t => t.taskType === 'obligation' && (t.status === 'completed' || t.status === 'validated')).length;
-  const totalObligations = tasks.filter(t => t.taskType === 'obligation').length;
+  const completedDuties = filteredByDayTasks.filter(t => t.taskType === 'duty' && (t.status === 'completed' || t.status === 'validated')).length;
+  const totalDuties = filteredByDayTasks.filter(t => t.taskType === 'duty').length;
+  const completedObligations = filteredByDayTasks.filter(t => t.taskType === 'obligation' && (t.status === 'completed' || t.status === 'validated')).length;
+  const totalObligations = filteredByDayTasks.filter(t => t.taskType === 'obligation').length;
 
   const dutyProgress = totalDuties > 0 ? (completedDuties / totalDuties) * 100 : 0;
   const obligationProgress = totalObligations > 0 ? (completedObligations / totalObligations) * 100 : 0;
@@ -565,7 +1095,18 @@ function Dashboard({ tasks, user, setView, onPassTask, onCompleteDuty, isDarkMod
           </div>
         </div>
         <div className="flex items-center gap-4">
+          <div className={`hidden sm:flex items-center gap-1 px-2 py-1 rounded-full text-[8px] font-black uppercase tracking-widest ${isConnected ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600'}`}>
+            <div className={`size-1.5 rounded-full ${isConnected ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`}></div>
+            {isConnected ? 'Sincronizado' : 'Desconectado'}
+          </div>
           <div className="flex items-center gap-1">
+            <button 
+              onClick={() => setView('tutorial')}
+              className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-primary hover:scale-105 transition-transform mr-2"
+              title="Guía de Inicio"
+            >
+              <Book size={20} />
+            </button>
             <Heart className="text-red-500 fill-red-500" size={20} />
             <span className={`font-bold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>{user.hearts}</span>
           </div>
@@ -585,13 +1126,79 @@ function Dashboard({ tasks, user, setView, onPassTask, onCompleteDuty, isDarkMod
               <span className={`text-2xl font-black ${isDarkMode ? 'text-white' : 'text-slate-800'}`}>{user.xp}</span>
             </div>
           </div>
-          <div className={`rounded-xl p-4 border-2 duo-shadow transition-colors duration-300 ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-100'}`}>
-            <p className="text-slate-500 text-xs font-bold uppercase tracking-wider">Racha Semanal</p>
-            <div className="flex items-center gap-2 mt-1">
-              <Calendar className="text-orange-500" size={20} />
-              <span className={`text-2xl font-black ${isDarkMode ? 'text-white' : 'text-slate-800'}`}>{user.streak}/14</span>
-            </div>
+          <button 
+            onClick={() => setView('task-selection')}
+            className={`rounded-xl p-4 border-2 border-primary/20 bg-primary/5 duo-shadow flex flex-col items-center justify-center gap-1 hover:bg-primary/10 transition-all`}
+          >
+            <Plus className="text-primary" size={24} />
+            <span className="text-primary font-black text-[10px] uppercase tracking-widest">Solicitar Tareas</span>
+          </button>
+        </section>
+
+        {/* Day Filter Section */}
+        <section className="space-y-3">
+          <h3 className="font-black text-xs uppercase tracking-widest text-slate-400 px-1">Filtro por Día</h3>
+          <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-hide">
+            {dayNames.map(day => (
+              <button
+                key={day}
+                onClick={() => setSelectedDay(day)}
+                className={`shrink-0 px-4 py-2 rounded-xl font-bold text-xs transition-all ${selectedDay === day ? 'bg-primary text-white shadow-lg shadow-primary/20' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}
+              >
+                {day}
+              </button>
+            ))}
           </div>
+        </section>
+
+        {/* Online Users Section */}
+        <section className="space-y-3">
+          <h3 className="font-black text-xs uppercase tracking-widest text-slate-400 px-1">En Línea Ahora</h3>
+          <div className="flex gap-3 overflow-x-auto pb-2 scrollbar-hide">
+            <div className="flex flex-col items-center gap-1 min-w-[60px]">
+              <div className="relative">
+                <img src={user.avatar} alt="Me" className="size-12 rounded-full border-2 border-emerald-500 p-0.5" />
+                <div className="absolute bottom-0 right-0 size-3 bg-emerald-500 border-2 border-white dark:border-slate-900 rounded-full"></div>
+              </div>
+              <span className="text-[10px] font-bold text-slate-500">Tú</span>
+            </div>
+            {onlineMembers.map(m => (
+              <div key={m.id} className="flex flex-col items-center gap-1 min-w-[60px]">
+                <div className="relative">
+                  <img src={m.avatar} alt={m.name} className="size-12 rounded-full border-2 border-emerald-500 p-0.5" />
+                  <div className="absolute bottom-0 right-0 size-3 bg-emerald-500 border-2 border-white dark:border-slate-900 rounded-full"></div>
+                </div>
+                <span className="text-[10px] font-bold text-slate-500">{m.name}</span>
+              </div>
+            ))}
+            {onlineMembers.length === 0 && (
+              <p className="text-[10px] font-bold text-slate-400 italic py-4">Nadie más está en línea</p>
+            )}
+          </div>
+        </section>
+
+        {/* Admin Availability Calendar */}
+        <section className={`rounded-2xl p-5 border-2 transition-colors duration-300 ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-100'}`}>
+          <div className="flex items-center gap-2 mb-4">
+            <Calendar className="text-primary" size={20} />
+            <h3 className="font-bold text-sm uppercase tracking-widest">Disponibilidad Admin</h3>
+          </div>
+          <div className="grid grid-cols-7 gap-1">
+            {['L', 'M', 'X', 'J', 'V', 'S', 'D'].map((day, i) => {
+              const dayNames = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
+              const dayName = dayNames[i];
+              const isAvailable = admins.some(a => a.availability?.[dayName]?.length);
+              return (
+                <div key={day} className="flex flex-col items-center gap-1">
+                  <span className="text-[10px] font-black text-slate-400">{day}</span>
+                  <div className={`size-8 rounded-lg flex items-center justify-center text-[10px] font-bold transition-all ${isAvailable ? 'bg-primary/20 text-primary border-2 border-primary/30' : 'bg-slate-100 dark:bg-slate-700 text-slate-300 border-2 border-transparent'}`}>
+                    {isAvailable ? '✓' : '×'}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <p className="text-[10px] font-bold text-slate-400 mt-3 italic text-center">Consulta con Kevin o Jefa para validaciones</p>
         </section>
 
         <section className={`rounded-2xl p-5 border-2 transition-colors duration-300 ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-100'}`}>
@@ -667,7 +1274,17 @@ function Dashboard({ tasks, user, setView, onPassTask, onCompleteDuty, isDarkMod
                 key={task.id} 
                 task={task} 
                 onPass={() => onPassTask(task)} 
-                onComplete={() => onCompleteDuty(task.id)}
+                onComplete={() => {
+                  if (task.taskType === 'obligation' && !canCompleteObligation) {
+                    alert('Has alcanzado el límite de 2 obligaciones por día.');
+                    return;
+                  }
+                  if (task.taskType === 'duty' && !canCompleteDuty) {
+                    alert('Has alcanzado el límite de 5 deberes por día.');
+                    return;
+                  }
+                  onCompleteDuty(task.id);
+                }}
                 darkMode={isDarkMode}
               />
             ))}
@@ -806,13 +1423,35 @@ function LoginScreen({ onLogin, darkMode }: { onLogin: (email: string, pass: str
   );
 }
 
-function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, onCreateUser, onUpdateUser, onValidateTask, onStartVoting, onAssignTask, onDeleteTask, onAddAlert, setView, tasks, currentUser, paymentConfig, onUpdatePaymentConfig }: { 
+function AdminDashboard({ 
+  members, 
+  payments, 
+  onApprovePayment, 
+  onRejectPayment, 
+  onCreateUser, 
+  onDeleteUser, 
+  onUpdateUser, 
+  onValidateTask, 
+  onStartVoting, 
+  onAssignTask, 
+  onDeleteTask, 
+  onAddAlert, 
+  setView, 
+  tasks, 
+  currentUser, 
+  paymentConfig, 
+  onUpdatePaymentConfig,
+  taskRequests,
+  onApproveRequest,
+  onRejectRequest
+}: { 
   members: Member[], 
   payments: Payment[],
   tasks: Task[],
   onApprovePayment: (id: string) => void,
   onRejectPayment: (id: string) => void,
   onCreateUser: (m: Member) => void,
+  onDeleteUser: (id: string) => void,
   onUpdateUser: (m: Member) => void,
   onValidateTask: (taskId: string, approved: boolean, customDebtChange?: number) => void,
   onStartVoting?: (taskId: string) => void,
@@ -822,18 +1461,29 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
   setView: (v: View) => void,
   currentUser: Member,
   paymentConfig: { type: 'nequi' | 'bancolombia', number: string, owner: string },
-  onUpdatePaymentConfig: (config: { type: 'nequi' | 'bancolombia', number: string, owner: string }) => void
+  onUpdatePaymentConfig: (config: { type: 'nequi' | 'bancolombia', number: string, owner: string }) => void,
+  taskRequests: TaskRequest[],
+  onApproveRequest: (r: TaskRequest) => void,
+  onRejectRequest: (id: string) => void
 }) {
-  const [activeTab, setActiveTab] = useState<'stats' | 'users' | 'tasks' | 'payments' | 'assign' | 'alerts' | 'calendar' | 'config'>('stats');
+  const [activeTab, setActiveTab] = useState<'stats' | 'users' | 'tasks' | 'payments' | 'assign' | 'alerts' | 'calendar' | 'config' | 'logs' | 'requests'>('requests');
   const [showCreateUser, setShowCreateUser] = useState(false);
   const [editingUser, setEditingUser] = useState<Member | null>(null);
   const [selectedTaskForAssign, setSelectedTaskForAssign] = useState<string | null>(null);
   const [selectedUserForAssign, setSelectedUserForAssign] = useState<string | null>(null);
+  const [logs, setLogs] = useState<any[]>([]);
+
+  useEffect(() => {
+    if (activeTab === 'logs') {
+      fetch('/api/logs').then(res => res.json()).then(setLogs);
+    }
+  }, [activeTab]);
   
   // Alert Form State
   const [alertTitle, setAlertTitle] = useState('');
   const [alertMessage, setAlertMessage] = useState('');
   const [alertType, setAlertType] = useState<'duty' | 'task' | 'general'>('general');
+  const [alertRecipients, setAlertRecipients] = useState<string[]>([]);
   
   // Create/Edit User Form State
   const [newUserName, setNewUserName] = useState('');
@@ -841,6 +1491,9 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
   const [newUserPass, setNewUserPass] = useState('');
   const [newUserRole, setNewUserRole] = useState<'admin' | 'member'>('member');
   const [newUserDebt, setNewUserDebt] = useState(0);
+  const [newUserMonthlyDebt, setNewUserMonthlyDebt] = useState(0);
+  const [newUserXP, setNewUserXP] = useState(0);
+  const [newUserAvatar, setNewUserAvatar] = useState('');
 
   // Payment Config Form State
   const [editPaymentNumber, setEditPaymentNumber] = useState(paymentConfig.number);
@@ -860,7 +1513,10 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
         email: newUserEmail,
         password: newUserPass,
         role: newUserRole,
-        debt: newUserDebt
+        debt: newUserDebt,
+        monthlyDebt: newUserMonthlyDebt,
+        xp: newUserXP,
+        avatar: newUserAvatar || editingUser.avatar
       });
       setEditingUser(null);
     } else {
@@ -871,11 +1527,12 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
         password: newUserPass,
         role: newUserRole,
         level: 1,
-        xp: 0,
+        xp: newUserXP || 0,
         hearts: 5,
         streak: 0,
         debt: newUserDebt || -50000,
-        avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${newUserName}`,
+        monthlyDebt: newUserMonthlyDebt || 0,
+        avatar: newUserAvatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${newUserName}`,
         progress: 0,
         settings: { darkMode: false }
       };
@@ -887,6 +1544,9 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
     setNewUserEmail('');
     setNewUserPass('');
     setNewUserDebt(0);
+    setNewUserMonthlyDebt(0);
+    setNewUserXP(0);
+    setNewUserAvatar('');
   };
 
   const startEditing = (member: Member) => {
@@ -896,6 +1556,9 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
     setNewUserPass(member.password || '');
     setNewUserRole(member.role);
     setNewUserDebt(member.debt);
+    setNewUserMonthlyDebt(member.monthlyDebt || 0);
+    setNewUserXP(member.xp);
+    setNewUserAvatar(member.avatar);
     setShowCreateUser(true);
   };
 
@@ -964,6 +1627,18 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
         >
           Config
         </button>
+        <button 
+          onClick={() => setActiveTab('requests')}
+          className={`shrink-0 px-4 py-2 rounded-xl font-bold text-sm transition-all ${activeTab === 'requests' ? 'bg-primary text-white shadow-lg shadow-primary/20' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}
+        >
+          Solicitudes
+        </button>
+        <button 
+          onClick={() => setActiveTab('logs')}
+          className={`shrink-0 px-4 py-2 rounded-xl font-bold text-sm transition-all ${activeTab === 'logs' ? 'bg-primary text-white shadow-lg shadow-primary/20' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}
+        >
+          Logs
+        </button>
       </div>
 
       <div className="flex-1 overflow-y-auto px-6 space-y-6 pb-20">
@@ -1000,7 +1675,30 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
               </div>
             </div>
 
-            <div className="space-y-4">
+            <div className="space-y-4 mt-6">
+              <h3 className="font-black text-sm uppercase tracking-widest text-slate-400">Estado de Miembros</h3>
+              <div className="grid grid-cols-1 gap-3">
+                {members.map(m => (
+                  <div key={m.id} className="p-4 bg-white dark:bg-slate-800 rounded-2xl border-2 border-slate-100 dark:border-slate-700 flex items-center justify-between shadow-sm">
+                    <div className="flex items-center gap-3">
+                      <img src={m.avatar} className="size-10 rounded-full border-2 border-primary/20" alt={m.name} />
+                      <div>
+                        <p className="font-bold text-slate-800 dark:text-white">{m.name}</p>
+                        <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Nivel {m.level}</p>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <p className={`text-sm font-black ${m.monthlyDebt < 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
+                        ${(m.monthlyDebt || 0).toLocaleString()}
+                      </p>
+                      <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Deuda Mensual</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-4 mt-6">
               <h3 className="font-black text-sm uppercase tracking-widest text-slate-400">Validar Tareas</h3>
               {tasks.filter(t => t.status === 'completed').length === 0 ? (
                 <p className="text-center py-4 text-slate-400 text-sm font-medium">No hay tareas para validar</p>
@@ -1138,9 +1836,39 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
                   <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Deuda Semanal (Negativo = Debe)</label>
                   <input 
                     type="number" 
-                    placeholder="Deuda" 
+                    placeholder="Deuda Semanal" 
                     value={newUserDebt}
                     onChange={(e) => setNewUserDebt(Number(e.target.value))}
+                    className="w-full p-3 rounded-xl border-2 bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white focus:border-primary outline-none"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Deuda Mensual (Acumulado)</label>
+                  <input 
+                    type="number" 
+                    placeholder="Deuda Mensual" 
+                    value={newUserMonthlyDebt}
+                    onChange={(e) => setNewUserMonthlyDebt(Number(e.target.value))}
+                    className="w-full p-3 rounded-xl border-2 bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white focus:border-primary outline-none"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Experiencia (XP)</label>
+                  <input 
+                    type="number" 
+                    placeholder="XP" 
+                    value={newUserXP}
+                    onChange={(e) => setNewUserXP(Number(e.target.value))}
+                    className="w-full p-3 rounded-xl border-2 bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white focus:border-primary outline-none"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">URL del Avatar</label>
+                  <input 
+                    type="text" 
+                    placeholder="https://..." 
+                    value={newUserAvatar}
+                    onChange={(e) => setNewUserAvatar(e.target.value)}
                     className="w-full p-3 rounded-xl border-2 bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white focus:border-primary outline-none"
                   />
                 </div>
@@ -1167,9 +1895,14 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
                   <img src={member.avatar} alt={member.name} className="size-10 rounded-full border-2 border-white shadow-sm" />
                   <div>
                     <p className="font-bold text-sm">{member.name}</p>
-                    <p className="text-[10px] text-slate-500 uppercase font-black tracking-widest">
-                      {member.role} • <span className={member.debt < 0 ? 'text-rose-500' : 'text-emerald-500'}>${member.debt.toLocaleString()}</span>
-                    </p>
+                    <div className="flex gap-2">
+                      <p className={`text-[10px] font-black uppercase tracking-widest ${member.debt < 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
+                        Sem: ${member.debt.toLocaleString()}
+                      </p>
+                      <p className={`text-[10px] font-black uppercase tracking-widest ${member.monthlyDebt < 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
+                        Mes: ${(member.monthlyDebt || 0).toLocaleString()}
+                      </p>
+                    </div>
                   </div>
                 </div>
                 <div className="flex gap-2">
@@ -1178,6 +1911,12 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
                     className="p-2 text-slate-400 hover:text-primary transition-all"
                   >
                     <Wrench size={18} />
+                  </button>
+                  <button 
+                    onClick={() => onDeleteUser(member.id)}
+                    className="p-2 text-rose-400 hover:text-rose-600 transition-all"
+                  >
+                    <Trash2 size={18} />
                   </button>
                   <button 
                     onClick={() => {
@@ -1302,30 +2041,78 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
 
         {activeTab === 'alerts' && (
           <div className="space-y-6">
-            <div className="p-4 bg-white dark:bg-slate-800 rounded-2xl border-2 border-primary/20 space-y-4 shadow-xl">
-              <h4 className="font-bold">Nueva Alerta</h4>
-              <input 
-                type="text" 
-                placeholder="Título de la alerta" 
-                value={alertTitle}
-                onChange={(e) => setAlertTitle(e.target.value)}
-                className="w-full p-3 rounded-xl border-2 bg-slate-50 dark:bg-slate-900 border-slate-100 dark:border-slate-700"
-              />
-              <textarea 
-                placeholder="Mensaje de la alerta" 
-                value={alertMessage}
-                onChange={(e) => setAlertMessage(e.target.value)}
-                className="w-full p-3 rounded-xl border-2 bg-slate-50 dark:bg-slate-900 border-slate-100 dark:border-slate-700 h-24 resize-none"
-              />
-              <select 
-                value={alertType}
-                onChange={(e) => setAlertType(e.target.value as any)}
-                className="w-full p-3 rounded-xl border-2 bg-slate-50 dark:bg-slate-900 border-slate-100 dark:border-slate-700"
-              >
-                <option value="general">General</option>
-                <option value="duty">Deber por cumplir</option>
-                <option value="task">Tarea pendiente</option>
-              </select>
+            <div className="p-6 bg-white dark:bg-slate-800 rounded-3xl border-2 border-primary/20 space-y-4 shadow-xl">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="size-10 rounded-xl bg-primary/10 flex items-center justify-center text-primary">
+                  <AlertTriangle size={20} />
+                </div>
+                <h4 className="font-black text-lg">Nueva Alerta Familiar</h4>
+              </div>
+              
+              <div className="space-y-1.5">
+                <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Título</label>
+                <input 
+                  type="text" 
+                  placeholder="Ej: ¡Reunión Urgente!" 
+                  value={alertTitle}
+                  onChange={(e) => setAlertTitle(e.target.value)}
+                  className="w-full p-4 rounded-xl border-2 bg-slate-50 dark:bg-slate-900 border-slate-100 dark:border-slate-700 text-slate-900 dark:text-white focus:border-primary outline-none font-bold"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Mensaje</label>
+                <textarea 
+                  placeholder="Escribe el mensaje aquí..." 
+                  value={alertMessage}
+                  onChange={(e) => setAlertMessage(e.target.value)}
+                  className="w-full p-4 rounded-xl border-2 bg-slate-50 dark:bg-slate-900 border-slate-100 dark:border-slate-700 text-slate-900 dark:text-white focus:border-primary outline-none font-medium h-32 resize-none"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Tipo de Alerta</label>
+                <div className="flex gap-2">
+                  {(['general', 'duty', 'task'] as const).map(type => (
+                    <button
+                      key={type}
+                      onClick={() => setAlertType(type)}
+                      className={`flex-1 py-3 rounded-xl border-2 font-bold text-xs uppercase tracking-widest transition-all ${alertType === type ? 'bg-primary border-primary text-white shadow-lg shadow-primary/20' : 'bg-slate-50 dark:bg-slate-900 border-slate-100 dark:border-slate-700 text-slate-400'}`}
+                    >
+                      {type === 'general' ? 'General' : type === 'duty' ? 'Deber' : 'Obligación'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Destinatarios</label>
+                <div className="flex flex-wrap gap-2">
+                  {members.map(m => (
+                    <button
+                      key={m.id}
+                      onClick={() => {
+                        if (alertRecipients.includes(m.id)) {
+                          setAlertRecipients(prev => prev.filter(id => id !== m.id));
+                        } else {
+                          setAlertRecipients(prev => [...prev, m.id]);
+                        }
+                      }}
+                      className={`flex items-center gap-2 px-3 py-2 rounded-xl border-2 transition-all ${alertRecipients.includes(m.id) ? 'bg-primary/10 border-primary text-primary' : 'bg-slate-50 dark:bg-slate-900 border-slate-100 dark:border-slate-700 text-slate-400'}`}
+                    >
+                      <img src={m.avatar} className="size-5 rounded-full" alt={m.name} />
+                      <span className="text-[10px] font-bold">{m.name}</span>
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => setAlertRecipients(alertRecipients.length === members.length ? [] : members.map(m => m.id))}
+                    className="px-3 py-2 rounded-xl border-2 border-slate-200 dark:border-slate-700 text-[10px] font-black uppercase tracking-widest"
+                  >
+                    {alertRecipients.length === members.length ? 'Ninguno' : 'Todos'}
+                  </button>
+                </div>
+              </div>
+
               <button 
                 onClick={() => {
                   if (!alertTitle || !alertMessage) return;
@@ -1335,24 +2122,204 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
                     message: alertMessage,
                     type: alertType,
                     date: new Date().toISOString(),
-                    createdBy: 'Admin'
+                    createdBy: currentUser.id,
+                    recipients: alertRecipients.length > 0 ? alertRecipients : undefined
                   });
                   setAlertTitle('');
                   setAlertMessage('');
-                  alert('Alerta creada con éxito');
+                  setAlertRecipients([]);
+                  alert('Alerta enviada con éxito');
                 }}
-                className="w-full py-3 bg-primary text-white font-bold rounded-xl"
+                className="w-full py-4 bg-primary text-white font-black uppercase tracking-wider rounded-xl shadow-lg shadow-primary/30 hover:bg-primary/90 transition-all active:scale-95"
               >
-                Crear Alerta
+                Enviar Alerta
               </button>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'requests' && (
+          <div className="space-y-6">
+            <div className="flex items-center justify-between">
+              <h3 className="font-black text-sm uppercase tracking-widest text-slate-400">Solicitudes y Aprobaciones</h3>
+              <div className="flex gap-2">
+                <div className="px-3 py-1 bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 rounded-full text-[10px] font-black uppercase tracking-widest">
+                  {taskRequests.filter(r => r.status === 'pending').length} Pendientes
+                </div>
+              </div>
+            </div>
+
+            {/* Task Requests Section */}
+            <div className="space-y-4">
+              <h4 className="text-xs font-black uppercase tracking-widest text-slate-500 flex items-center gap-2">
+                <Calendar size={14} /> Solicitudes de Asignación
+              </h4>
+              {taskRequests.filter(r => r.status === 'pending').length === 0 ? (
+                <div className="text-center py-8 bg-slate-50 dark:bg-slate-900/50 rounded-2xl border-2 border-dashed border-slate-100 dark:border-slate-800">
+                  <p className="text-slate-400 text-sm font-medium italic">No hay solicitudes de asignación</p>
+                </div>
+              ) : (
+                taskRequests.filter(r => r.status === 'pending').map(req => {
+                  const user = members.find(m => m.id === req.userId);
+                  const task = tasks.find(t => t.id === req.taskId);
+                  return (
+                    <div key={req.id} className="p-4 bg-white dark:bg-slate-800 rounded-2xl border-2 border-slate-100 dark:border-slate-700 space-y-3 shadow-sm hover:border-primary/30 transition-colors">
+                      <div className="flex justify-between items-start">
+                        <div className="flex items-center gap-3">
+                          <img src={user?.avatar} className="size-10 rounded-full border-2 border-primary/20" alt={user?.name} />
+                          <div>
+                            <p className="font-bold text-slate-800 dark:text-white">{user?.name}</p>
+                            <p className="text-xs text-slate-500 font-medium">{task?.title}</p>
+                            <p className="text-[10px] font-black uppercase text-primary mt-0.5">{req.day} • {req.slot}</p>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex gap-2">
+                        <button 
+                          onClick={() => onApproveRequest(req)}
+                          className="flex-1 py-2.5 bg-emerald-500 text-white rounded-xl font-black text-xs uppercase tracking-widest shadow-lg shadow-emerald-500/20 active:scale-95 transition-all"
+                        >
+                          Aprobar
+                        </button>
+                        <button 
+                          onClick={() => onRejectRequest(req.id)}
+                          className="flex-1 py-2.5 bg-rose-500 text-white rounded-xl font-black text-xs uppercase tracking-widest shadow-lg shadow-rose-500/20 active:scale-95 transition-all"
+                        >
+                          Rechazar
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {/* Task Validation Section (Completed Tasks) */}
+            <div className="space-y-4 pt-4 border-t-2 border-slate-100 dark:border-slate-800">
+              <h4 className="text-xs font-black uppercase tracking-widest text-slate-500 flex items-center gap-2">
+                <CheckCircle2 size={14} /> Tareas por Validar
+              </h4>
+              {tasks.filter(t => t.status === 'completed').length === 0 ? (
+                <div className="text-center py-8 bg-slate-50 dark:bg-slate-900/50 rounded-2xl border-2 border-dashed border-slate-100 dark:border-slate-800">
+                  <p className="text-slate-400 text-sm font-medium italic">No hay tareas completadas esperando validación</p>
+                </div>
+              ) : (
+                tasks.filter(t => t.status === 'completed').map(task => {
+                  const user = members.find(m => m.id === task.assignedTo);
+                  return (
+                    <div key={task.id} className="p-5 bg-white dark:bg-slate-800 rounded-3xl border-2 border-slate-100 dark:border-slate-700 space-y-4 shadow-md">
+                      <div className="flex justify-between items-start">
+                        <div className="flex items-center gap-3">
+                          <img src={user?.avatar} className="size-12 rounded-2xl border-2 border-primary/20" alt={user?.name} />
+                          <div>
+                            <p className="font-black text-slate-800 dark:text-white">{user?.name}</p>
+                            <h5 className="text-sm font-bold text-primary">{task.title}</h5>
+                            <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest">{task.taskType === 'obligation' ? 'Obligación' : 'Deber'}</p>
+                          </div>
+                        </div>
+                        <div className="text-right">
+                          <p className="text-lg font-black text-emerald-500">+{task.xp} XP</p>
+                          <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Recompensa</p>
+                        </div>
+                      </div>
+
+                      {task.imageUrl && (
+                        <div className="aspect-video rounded-2xl overflow-hidden border-2 border-slate-100 dark:border-slate-700">
+                          <ZoomableImage src={task.imageUrl} alt="Evidence" className="w-full h-full object-cover" />
+                        </div>
+                      )}
+
+                      <div className="flex gap-3">
+                        <button 
+                          onClick={() => onValidateTask(task.id, false)}
+                          className="flex-1 py-3 bg-rose-500 text-white rounded-2xl font-black text-xs uppercase tracking-widest shadow-lg shadow-rose-500/20 active:scale-95 transition-all"
+                        >
+                          Rechazar
+                        </button>
+                        <button 
+                          onClick={() => onValidateTask(task.id, true)}
+                          className="flex-[2] py-3 bg-emerald-500 text-white rounded-2xl font-black text-xs uppercase tracking-widest shadow-lg shadow-emerald-500/20 active:scale-95 transition-all"
+                        >
+                          Validar Tarea
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'logs' && (
+          <div className="space-y-4">
+            <h3 className="font-black text-sm uppercase tracking-widest text-slate-400">Registro de Actividad</h3>
+            <div className="space-y-2">
+              {logs.map(log => (
+                <div key={log.id} className="p-3 bg-white dark:bg-slate-800 rounded-xl border-2 border-slate-100 dark:border-slate-700 shadow-sm">
+                  <div className="flex justify-between items-start mb-1">
+                    <p className="font-bold text-xs text-primary">{log.userName}</p>
+                    <p className="text-[8px] font-black text-slate-400 uppercase">{new Date(log.timestamp).toLocaleString()}</p>
+                  </div>
+                  <p className="text-xs font-black uppercase tracking-widest text-slate-500 mb-1">{log.action}</p>
+                  <p className="text-xs text-slate-600 dark:text-slate-400">{log.details}</p>
+                </div>
+              ))}
+              {logs.length === 0 && <p className="text-center py-10 text-slate-400 text-sm italic">No hay registros aún</p>}
             </div>
           </div>
         )}
 
         {activeTab === 'calendar' && (
           <div className="space-y-6 pb-10">
-            <h3 className="font-black text-sm uppercase tracking-widest text-slate-400">Disponibilidad Familiar</h3>
-            {members.map(member => (
+            <h3 className="font-black text-sm uppercase tracking-widest text-slate-400">Gestionar Disponibilidad</h3>
+            <div className="p-6 bg-white dark:bg-slate-800 rounded-3xl border-2 border-primary/10 space-y-4">
+              <div className="flex items-center gap-3">
+                <img src={currentUser.avatar} alt="Me" className="size-10 rounded-full" />
+                <div>
+                  <p className="font-bold">Tu Disponibilidad (Admin)</p>
+                  <p className="text-[10px] text-slate-500 font-black uppercase tracking-widest">Se verá en el calendario familiar</p>
+                </div>
+              </div>
+              
+              <div className="space-y-4">
+                {['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'].map(day => (
+                  <div key={day} className="space-y-2">
+                    <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">{day}</p>
+                    <div className="flex gap-2">
+                      {['Mañana', 'Tarde', 'Noche'].map(slot => {
+                        const isSelected = currentUser.availability?.[day]?.includes(slot);
+                        return (
+                          <button
+                            key={slot}
+                            onClick={() => {
+                              const currentDaySlots = currentUser.availability?.[day] || [];
+                              const nextSlots = isSelected 
+                                ? currentDaySlots.filter(s => s !== slot)
+                                : [...currentDaySlots, slot];
+                              
+                              onUpdateUser({
+                                ...currentUser,
+                                availability: {
+                                  ...currentUser.availability,
+                                  [day]: nextSlots
+                                }
+                              });
+                            }}
+                            className={`flex-1 py-2 rounded-xl text-[10px] font-bold transition-all border-2 ${isSelected ? 'bg-primary/10 border-primary text-primary' : 'bg-slate-50 dark:bg-slate-900 border-slate-100 dark:border-slate-800 text-slate-400'}`}
+                          >
+                            {slot}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <h3 className="font-black text-sm uppercase tracking-widest text-slate-400 pt-4">Otros Miembros</h3>
+            {members.filter(m => m.id !== currentUser.id).map(member => (
               <div key={member.id} className="p-4 bg-white dark:bg-slate-800 rounded-2xl border-2 border-slate-100 dark:border-slate-700 space-y-3">
                 <div className="flex items-center gap-3">
                   <img src={member.avatar} alt={member.name} className="size-8 rounded-full" />
@@ -1451,6 +2418,23 @@ function AdminDashboard({ members, payments, onApprovePayment, onRejectPayment, 
                 Esta cuenta será la que se muestre a todos los usuarios en la pantalla de liquidación semanal para realizar sus pagos por tareas no ejecutadas.
               </p>
             </div>
+
+            <div className={`p-6 bg-primary/5 rounded-3xl border-2 border-primary/20 space-y-4`}>
+              <div className="flex items-center gap-3 text-primary">
+                <Shield size={24} />
+                <h4 className="font-black text-lg">¿Cómo publicar en Play Store?</h4>
+              </div>
+              <div className="space-y-3 text-sm font-medium text-slate-600 dark:text-slate-400">
+                <p>Para convertir esta PWA en una aplicación real de la Play Store, sigue estos pasos:</p>
+                <ol className="list-decimal list-inside space-y-2">
+                  <li>Crea una cuenta de desarrollador en <span className="text-primary font-bold">Google Play Console</span> ($25 USD).</li>
+                  <li>Usa <span className="text-primary font-bold">Bubblewrap</span> para empaquetar la web como un archivo .TWA.</li>
+                  <li>Genera el archivo <span className="text-primary font-bold">assetlinks.json</span> y colócalo en <code className="bg-slate-200 dark:bg-slate-700 px-1 rounded">.well-known/</code> de tu servidor.</li>
+                  <li>Sube el archivo .aab generado a la consola de Google Play.</li>
+                </ol>
+                <p className="text-xs italic mt-4">Nota: Al ser una PWA, los usuarios ya pueden instalarla directamente desde Chrome sin pasar por la tienda.</p>
+              </div>
+            </div>
           </div>
         )}
       </div>
@@ -1463,66 +2447,151 @@ function AdminDashboardOld({ members, setView }: { members: Member[], setView: (
 }
 
 function UploadEvidence({ task, setView, onComplete }: { task: Task | null, setView: (v: View) => void, onComplete: (proof: string) => void }) {
-  const [captured, setCaptured] = useState(false);
+  const [image, setImage] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setImage(reader.result as string);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const handleSubmit = () => {
+    if (!image) return;
+    setIsUploading(true);
+    // Simulate upload
+    setTimeout(() => {
+      onComplete(image);
+      setIsUploading(false);
+      setView('dashboard');
+    }, 1500);
+  };
+
+  if (!task) return null;
 
   return (
-    <div className="flex-1 flex flex-col p-4 space-y-6">
-      <header className="flex items-center gap-2">
-        <button onClick={() => setView('dashboard')} className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800"><X /></button>
-        <h1 className="text-lg font-bold">Evidencia de Tarea</h1>
+    <div className="flex-1 flex flex-col bg-slate-50 dark:bg-slate-950 p-4 space-y-6 overflow-y-auto">
+      <header className="flex items-center gap-4">
+        <button onClick={() => setView('dashboard')} className="p-2 rounded-xl bg-white dark:bg-slate-800 shadow-sm"><X /></button>
+        <h1 className="text-lg font-black">Subir Evidencia</h1>
       </header>
-      <div className="bg-white dark:bg-slate-800 rounded-xl p-4 shadow-sm border border-slate-100 dark:border-slate-700 flex items-center gap-4">
-        <div className="h-16 w-16 rounded-lg bg-primary/10 flex items-center justify-center">
-          {task && React.createElement(IconMap[task.icon] || Utensils, { className: "text-primary", size: 32 })}
-        </div>
-        <div>
-          <p className="text-xs font-bold text-primary uppercase tracking-widest">Tarea Seleccionada</p>
-          <h2 className="text-xl font-bold">{task?.title || 'Sin tarea'}</h2>
-        </div>
-      </div>
-      <div className="flex-1 flex flex-col items-center justify-center space-y-6">
-        {captured ? (
-          <div className="w-full space-y-6">
-            <div className="aspect-square w-full rounded-2xl overflow-hidden border-4 border-primary shadow-xl">
-              <img src="https://picsum.photos/seed/task-proof/800/800" className="w-full h-full object-cover" alt="Proof" />
-            </div>
-            <div className="flex gap-4">
-              <button 
-                onClick={() => setCaptured(false)}
-                className="flex-1 py-4 rounded-xl bg-slate-100 dark:bg-slate-800 font-bold text-slate-600 dark:text-slate-400"
-              >
-                Repetir
-              </button>
-              <button 
-                onClick={() => onComplete('https://picsum.photos/seed/task-proof/800/800')}
-                className="flex-[2] py-4 rounded-xl bg-primary text-white font-black uppercase tracking-wider shadow-lg shadow-primary/30"
-              >
-                Enviar Prueba
-              </button>
-            </div>
+
+      <div className="bg-white dark:bg-slate-800 p-6 rounded-3xl border-2 border-slate-100 dark:border-slate-700 duo-shadow space-y-6">
+        <div className="flex items-center gap-4">
+          <div className="size-14 rounded-2xl bg-primary/10 flex items-center justify-center text-primary">
+            {IconMap[task.icon] ? React.createElement(IconMap[task.icon], { size: 28 }) : <Star size={28} />}
           </div>
-        ) : (
-          <>
-            <h3 className="text-2xl font-bold text-center">Sube tu prueba para +{task?.xp || 0} XP</h3>
+          <div>
+            <h2 className="text-xl font-black text-slate-800 dark:text-white">{task.title}</h2>
+            <p className="text-sm text-slate-500 dark:text-slate-400">{task.description}</p>
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          <p className="text-xs font-black uppercase tracking-widest text-slate-400 text-center">Captura o selecciona una foto real</p>
+          
+          <div 
+            onClick={() => !image && fileInputRef.current?.click()}
+            className={`aspect-square rounded-2xl border-4 border-dashed flex flex-col items-center justify-center gap-3 transition-all cursor-pointer overflow-hidden relative ${image ? 'border-primary' : 'border-slate-200 dark:border-slate-700 hover:border-primary/50 bg-slate-50 dark:bg-slate-900'}`}
+          >
+            {image ? (
+              <>
+                <img src={image} className="w-full h-full object-cover" alt="Evidence" />
+                <button 
+                  onClick={(e) => { e.stopPropagation(); setImage(null); }}
+                  className="absolute top-3 right-3 p-2 bg-rose-500 text-white rounded-full shadow-lg"
+                >
+                  <X size={16} />
+                </button>
+              </>
+            ) : (
+              <>
+                <div className="size-16 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-400">
+                  <Camera size={32} />
+                </div>
+                <p className="text-sm font-bold text-slate-500">Tocar para capturar</p>
+              </>
+            )}
+          </div>
+
+          <div className="flex gap-3">
             <button 
-              onClick={() => setCaptured(true)}
-              className="size-48 rounded-full bg-primary text-white shadow-xl shadow-primary/30 flex flex-col items-center justify-center gap-2 hover:scale-105 transition-transform"
+              onClick={() => {
+                if (fileInputRef.current) {
+                  fileInputRef.current.setAttribute('capture', 'environment');
+                  fileInputRef.current.click();
+                }
+              }}
+              className="flex-1 py-4 rounded-2xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold flex items-center justify-center gap-2"
             >
-              <Camera size={48} />
-              <span className="font-bold">Capturar</span>
+              <Camera size={20} />
+              Cámara
             </button>
-          </>
-        )}
+            <button 
+              onClick={() => {
+                if (fileInputRef.current) {
+                  fileInputRef.current.removeAttribute('capture');
+                  fileInputRef.current.click();
+                }
+              }}
+              className="flex-1 py-4 rounded-2xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold flex items-center justify-center gap-2"
+            >
+              <ImageIcon size={20} />
+              Galería
+            </button>
+          </div>
+
+          <input 
+            type="file" 
+            ref={fileInputRef} 
+            className="hidden" 
+            accept="image/*" 
+            onChange={handleFileChange} 
+          />
+        </div>
+
+        <button 
+          onClick={handleSubmit}
+          disabled={!image || isUploading}
+          className={`w-full py-4 rounded-2xl font-black uppercase tracking-widest transition-all flex items-center justify-center gap-2 ${image && !isUploading ? 'bg-primary text-white shadow-lg shadow-primary/20' : 'bg-slate-100 dark:bg-slate-700 text-slate-400 cursor-not-allowed'}`}
+        >
+          {isUploading ? (
+            <>
+              <RefreshCw className="animate-spin" size={20} />
+              Subiendo...
+            </>
+          ) : (
+            <>
+              <CheckCircle2 size={20} />
+              Confirmar Entrega
+            </>
+          )}
+        </button>
+      </div>
+
+      <div className="bg-amber-50 dark:bg-amber-900/20 p-4 rounded-2xl border-2 border-amber-100 dark:border-amber-800/50 flex gap-3">
+        <AlertTriangle className="text-amber-500 shrink-0" size={20} />
+        <p className="text-xs text-amber-700 dark:text-amber-400 font-medium">
+          Asegúrate de que la foto sea clara. El administrador revisará esta evidencia antes de validar tu recompensa.
+        </p>
       </div>
     </div>
   );
 }
 
-function AlertScreen({ alerts, setView, user, onAddAlert }: { alerts: Alert[], setView: (v: View) => void, user: Member, onAddAlert: (a: Alert) => void }) {
+function AlertScreen({ alerts, setView, user, onAddAlert, members }: { alerts: Alert[], setView: (v: View) => void, user: Member, onAddAlert: (a: Alert) => void, members: Member[] }) {
   const isDarkMode = user.settings?.darkMode;
 
+  const myAlerts = alerts.filter(a => !a.recipients || a.recipients.length === 0 || a.recipients.includes(user.id));
+
   return (
-    <div className="flex-1 flex flex-col">
+    <div className="flex-1 flex flex-col h-full overflow-hidden">
       <header className={`p-4 border-b-2 flex items-center justify-between transition-colors duration-300 ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-100'}`}>
         <div className="flex items-center gap-4">
           <button onClick={() => setView('dashboard')} className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800"><X /></button>
@@ -1531,15 +2600,15 @@ function AlertScreen({ alerts, setView, user, onAddAlert }: { alerts: Alert[], s
       </header>
 
       <main className="flex-1 p-6 space-y-4 overflow-y-auto">
-        {alerts.length === 0 ? (
+        {myAlerts.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-center space-y-4 opacity-50">
             <div className="size-20 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center">
               <AlertTriangle size={40} className="text-slate-400" />
             </div>
-            <p className="font-bold text-slate-500">No hay alertas activas</p>
+            <p className="font-bold text-slate-500">No hay alertas activas para ti</p>
           </div>
         ) : (
-          alerts.map(alert => (
+          myAlerts.map(alert => (
             <div key={alert.id} className={`p-5 rounded-2xl border-2 duo-shadow transition-all ${alert.type === 'duty' ? 'bg-orange-50 border-orange-100 dark:bg-orange-900/20 dark:border-orange-900/30' : alert.type === 'task' ? 'bg-blue-50 border-blue-100 dark:bg-blue-900/20 dark:border-blue-900/30' : 'bg-slate-50 border-slate-100 dark:bg-slate-800 dark:border-slate-700'}`}>
               <div className="flex items-start justify-between mb-2">
                 <div className="flex items-center gap-2">
@@ -1550,7 +2619,19 @@ function AlertScreen({ alerts, setView, user, onAddAlert }: { alerts: Alert[], s
                 </div>
                 <span className="text-[10px] font-bold text-slate-400 uppercase">{new Date(alert.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
               </div>
-              <p className={`text-sm font-medium ${alert.type === 'duty' ? 'text-orange-600/80 dark:text-orange-400/80' : alert.type === 'task' ? 'text-blue-600/80 dark:text-blue-400/80' : 'text-slate-500'}`}>{alert.message}</p>
+              <p className={`text-sm font-bold leading-relaxed mb-3 ${alert.type === 'duty' ? 'text-orange-900 dark:text-orange-200' : alert.type === 'task' ? 'text-blue-900 dark:text-blue-200' : 'text-slate-900 dark:text-slate-100'}`}>{alert.message}</p>
+              
+              {alert.recipients && alert.recipients.length > 0 && (
+                <div className="flex items-center gap-2 pt-2 border-t border-black/5 dark:border-white/5">
+                  <span className="text-[8px] font-black uppercase text-slate-400">Para:</span>
+                  <div className="flex -space-x-2">
+                    {alert.recipients.map(rid => {
+                      const m = members.find(mem => mem.id === rid);
+                      return m ? <img key={rid} src={m.avatar} className="size-5 rounded-full border border-white dark:border-slate-800" title={m.name} alt={m.name} /> : null;
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
           ))
         )}
@@ -1559,10 +2640,189 @@ function AlertScreen({ alerts, setView, user, onAddAlert }: { alerts: Alert[], s
   );
 }
 
-function ChatScreen({ messages, user, setView, onSendMessage, onDeleteMessage }: { messages: ChatMessage[], user: Member, setView: (v: View) => void, onSendMessage: (m: ChatMessage) => void, onDeleteMessage: (id: string) => void }) {
+function WelcomeTutorial({ step, onNext, onSkip, onFinish }: { step: number, onNext: () => void, onSkip: () => void, onFinish: () => void }) {
+  const steps = [
+    {
+      title: "¡Bienvenido a Family Quest!",
+      description: "Esta aplicación te ayudará a gestionar tus tareas diarias y obligaciones familiares de forma divertida.",
+      icon: <Shield className="text-primary" size={48} />
+    },
+    {
+      title: "Configura tu Perfil",
+      description: "Lo primero es ir a tu perfil y configurar tu número de Nequi/Bancolombia y tus horarios de disponibilidad.",
+      icon: <User className="text-blue-500" size={48} />
+    },
+    {
+      title: "Solicita Tareas",
+      description: "En la sección 'Solicitar Tareas' podrás elegir qué quieres hacer cada día. Recuerda los límites diarios.",
+      icon: <Plus className="text-emerald-500" size={48} />
+    },
+    {
+      title: "Sube Evidencias",
+      description: "Para las Obligaciones, deberás subir una foto como prueba. El administrador validará tu trabajo.",
+      icon: <Camera className="text-amber-500" size={48} />
+    },
+    {
+      title: "Evita Penalidades",
+      description: "Si no completas tus tareas a tiempo, se te cobrará una multa automáticamente. ¡Mantente al día!",
+      icon: <AlertTriangle className="text-rose-500" size={48} />
+    }
+  ];
+
+  const currentStep = steps[step];
+
+  return (
+    <motion.div 
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-6"
+    >
+      <motion.div 
+        initial={{ scale: 0.9, y: 20 }}
+        animate={{ scale: 1, y: 0 }}
+        className="bg-white dark:bg-slate-900 w-full max-w-sm rounded-[32px] overflow-hidden shadow-2xl border-2 border-primary/20"
+      >
+        <div className="p-8 text-center space-y-6">
+          <div className="size-24 bg-slate-50 dark:bg-slate-800 rounded-3xl flex items-center justify-center mx-auto shadow-inner">
+            {currentStep.icon}
+          </div>
+          
+          <div className="space-y-2">
+            <h2 className="text-2xl font-black tracking-tight">{currentStep.title}</h2>
+            <p className="text-slate-500 dark:text-slate-400 font-medium leading-relaxed">
+              {currentStep.description}
+            </p>
+          </div>
+
+          <div className="flex gap-1 justify-center">
+            {steps.map((_, i) => (
+              <div 
+                key={i} 
+                className={`h-1.5 rounded-full transition-all duration-300 ${i === step ? 'w-8 bg-primary' : 'w-2 bg-slate-200 dark:bg-slate-700'}`} 
+              />
+            ))}
+          </div>
+
+          <div className="flex flex-col gap-3 pt-4">
+            {step < steps.length - 1 ? (
+              <>
+                <button 
+                  onClick={onNext}
+                  className="w-full py-4 bg-primary text-white font-black uppercase tracking-widest rounded-2xl shadow-lg shadow-primary/20 active:scale-95 transition-all"
+                >
+                  Siguiente
+                </button>
+                <button 
+                  onClick={onSkip}
+                  className="w-full py-2 text-slate-400 font-bold text-xs uppercase tracking-widest hover:text-slate-600 transition-colors"
+                >
+                  Saltar Tutorial
+                </button>
+              </>
+            ) : (
+              <button 
+                onClick={onFinish}
+                className="w-full py-4 bg-emerald-500 text-white font-black uppercase tracking-widest rounded-2xl shadow-lg shadow-emerald-500/20 active:scale-95 transition-all"
+              >
+                ¡Empezar ahora!
+              </button>
+            )}
+          </div>
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+}
+
+function TutorialView({ setView }: { setView: (v: View) => void }) {
+  const steps = [
+    {
+      title: "Configura tu Cuenta",
+      description: "Ve a tu perfil y asegúrate de colocar tu número de Nequi o Bancolombia para recibir pagos o gestionar deudas.",
+      icon: <CreditCard className="text-primary" size={32} />
+    },
+    {
+      title: "Define tu Horario",
+      description: "En tu perfil, selecciona los días y jornadas (Mañana, Tarde, Noche) en los que estás disponible para realizar tareas.",
+      icon: <Calendar className="text-blue-500" size={32} />
+    },
+    {
+      title: "Solicita Tareas",
+      description: "Ve a la sección 'Solicitar Tareas'. Podrás elegir entre Deberes (tareas diarias) y Obligaciones (tareas pesadas que requieren foto).",
+      icon: <Plus className="text-emerald-500" size={32} />
+    },
+    {
+      title: "Adjunta Evidencias",
+      description: "Cuando termines una Obligación, haz clic en 'Completar' y sube una foto real de lo que hiciste. El administrador la validará.",
+      icon: <Camera className="text-amber-500" size={32} />
+    },
+    {
+      title: "Evita Multas",
+      description: "Recuerda que las Obligaciones vencen en 1 día y los Deberes en 1 semana. Si no las haces, se te cobrará una multa automáticamente.",
+      icon: <AlertTriangle className="text-rose-500" size={32} />
+    }
+  ];
+
+  return (
+    <div className="flex-1 flex flex-col p-4 space-y-6 overflow-y-auto bg-slate-50 dark:bg-slate-950">
+      <header className="flex items-center gap-4">
+        <button onClick={() => setView('dashboard')} className="p-2 rounded-xl bg-white dark:bg-slate-800 shadow-sm"><X /></button>
+        <h1 className="text-lg font-black">Guía de Inicio</h1>
+      </header>
+
+      <div className="space-y-4">
+        {steps.map((step, i) => (
+          <motion.div 
+            key={i}
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: i * 0.1 }}
+            className="bg-white dark:bg-slate-800 p-5 rounded-2xl border-2 border-slate-100 dark:border-slate-700 duo-shadow flex gap-4"
+          >
+            <div className="size-14 rounded-xl bg-slate-50 dark:bg-slate-900 flex items-center justify-center shrink-0">
+              {step.icon}
+            </div>
+            <div className="space-y-1">
+              <h3 className="font-bold text-slate-800 dark:text-white">{step.title}</h3>
+              <p className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">{step.description}</p>
+            </div>
+          </motion.div>
+        ))}
+      </div>
+
+      <div className="bg-primary/5 dark:bg-primary/10 p-6 rounded-3xl border-2 border-primary/20 space-y-4">
+        <h3 className="font-black text-primary uppercase tracking-widest text-center">Lanzar en Android</h3>
+        <ol className="text-xs space-y-2 text-slate-600 dark:text-slate-400 list-decimal pl-4 font-medium">
+          <li>Abre esta URL en tu navegador Chrome en Android.</li>
+          <li>Toca los tres puntos (menú) en la esquina superior derecha.</li>
+          <li>Selecciona <b>"Instalar aplicación"</b> o <b>"Agregar a la pantalla de inicio"</b>.</li>
+          <li>¡Listo! Ahora tendrás FamilyQuest como una aplicación nativa en tu celular.</li>
+        </ol>
+      </div>
+
+      <button 
+        onClick={() => setView('dashboard')}
+        className="w-full py-4 bg-primary text-white font-black uppercase tracking-widest rounded-2xl shadow-lg shadow-primary/20 mt-4"
+      >
+        ¡Entendido!
+      </button>
+    </div>
+  );
+}
+
+function ChatScreen({ messages, user, setView, onSendMessage, onDeleteMessage, syncMessage }: { messages: ChatMessage[], user: Member, setView: (v: View) => void, onSendMessage: (m: ChatMessage) => void, onDeleteMessage: (id: string) => void, syncMessage: (m: ChatMessage) => void }) {
   const [inputText, setInputText] = useState('');
   const [image, setImage] = useState<string | null>(null);
   const isDarkMode = user.settings?.darkMode;
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages]);
 
   const handleSend = () => {
     if (!inputText && !image) return;
@@ -1580,12 +2840,24 @@ function ChatScreen({ messages, user, setView, onSendMessage, onDeleteMessage }:
       newMessage.text = newMessage.text.replace('/alerta ', '');
     }
     onSendMessage(newMessage);
+    syncMessage(newMessage);
     setInputText('');
     setImage(null);
   };
 
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setImage(reader.result as string);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
   return (
-    <div className="flex-1 flex flex-col h-full overflow-hidden">
+    <div className="flex-1 flex flex-col h-full overflow-hidden bg-slate-50 dark:bg-slate-950">
       <header className={`p-4 border-b-2 flex items-center justify-between transition-colors duration-300 ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-100'}`}>
         <div className="flex items-center gap-4">
           <button onClick={() => setView('dashboard')} className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800"><X /></button>
@@ -1599,7 +2871,7 @@ function ChatScreen({ messages, user, setView, onSendMessage, onDeleteMessage }:
         )}
       </header>
 
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.map(msg => (
           <div key={msg.id} className={`flex gap-3 ${msg.userId === user.id ? 'flex-row-reverse' : ''}`}>
             <img src={msg.userAvatar} className="size-8 rounded-full border-2 border-white shadow-sm self-end" alt={msg.userName} />
@@ -1610,7 +2882,11 @@ function ChatScreen({ messages, user, setView, onSendMessage, onDeleteMessage }:
               </div>
               <div className={`p-3 rounded-2xl relative group ${msg.isAdminAlert ? 'bg-orange-500 text-white shadow-lg shadow-orange-500/20' : (msg.userId === user.id ? 'bg-primary text-white' : (isDarkMode ? 'bg-slate-800 text-slate-200' : 'bg-slate-100 text-slate-800'))}`}>
                 {msg.isAdminAlert && <div className="flex items-center gap-1 mb-1 opacity-80"><AlertTriangle size={12} /> <span className="text-[10px] font-black uppercase tracking-widest">Alerta Admin</span></div>}
-                {msg.imageUrl && <ZoomableImage src={msg.imageUrl} className="rounded-xl mb-2 w-full max-h-48 object-cover" alt="Chat image" />}
+                {msg.imageUrl && (
+                  <div className="mt-1 rounded-xl overflow-hidden border border-white/20 mb-2">
+                    <ZoomableImage src={msg.imageUrl} className="w-full max-h-60 object-cover" alt="Chat image" />
+                  </div>
+                )}
                 <p className="text-sm font-medium leading-relaxed">{msg.text}</p>
                 
                 {user.role === 'admin' && (
@@ -1629,18 +2905,43 @@ function ChatScreen({ messages, user, setView, onSendMessage, onDeleteMessage }:
 
       <div className={`p-4 border-t-2 space-y-3 transition-colors duration-300 ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-100'}`}>
         {image && (
-          <div className="relative size-20 rounded-xl overflow-hidden border-2 border-primary">
+          <div className="relative size-24 rounded-2xl overflow-hidden border-2 border-primary shadow-lg">
             <img src={image} className="w-full h-full object-cover" alt="Preview" />
-            <button onClick={() => setImage(null)} className="absolute top-1 right-1 bg-black/50 text-white rounded-full p-0.5"><X size={12} /></button>
+            <button onClick={() => setImage(null)} className="absolute top-1 right-1 bg-rose-500 text-white rounded-full p-1 shadow-lg"><X size={12} /></button>
           </div>
         )}
         <div className="flex items-center gap-2">
-          <button 
-            onClick={() => setImage('https://picsum.photos/seed/chat/800/800')}
-            className={`p-3 rounded-xl transition-colors ${isDarkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-500'}`}
-          >
-            <Camera size={20} />
-          </button>
+          <div className="flex gap-1">
+            <button 
+              onClick={() => {
+                if (fileInputRef.current) {
+                  fileInputRef.current.setAttribute('capture', 'environment');
+                  fileInputRef.current.click();
+                }
+              }}
+              className={`p-3 rounded-xl transition-all active:scale-95 ${isDarkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-500'}`}
+            >
+              <Camera size={20} />
+            </button>
+            <button 
+              onClick={() => {
+                if (fileInputRef.current) {
+                  fileInputRef.current.removeAttribute('capture');
+                  fileInputRef.current.click();
+                }
+              }}
+              className={`p-3 rounded-xl transition-all active:scale-95 ${isDarkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-500'}`}
+            >
+              <ImageIcon size={20} />
+            </button>
+          </div>
+          <input 
+            type="file" 
+            ref={fileInputRef} 
+            className="hidden" 
+            accept="image/*" 
+            onChange={handleFileChange} 
+          />
           <input 
             type="text" 
             value={inputText}
@@ -1651,7 +2952,7 @@ function ChatScreen({ messages, user, setView, onSendMessage, onDeleteMessage }:
           />
           <button 
             onClick={handleSend}
-            className="p-3 bg-primary text-white rounded-xl shadow-lg shadow-primary/20"
+            className="p-3 bg-primary text-white rounded-xl shadow-lg shadow-primary/20 active:scale-95 transition-all"
           >
             <Plus size={20} />
           </button>
@@ -2076,7 +3377,7 @@ function InvitationScreen({ setView }: { setView: (v: View) => void }) {
   );
 }
 
-function PassTaskScreen({ task, setView }: { task: Task | null, setView: (v: View) => void }) {
+function PassTaskScreen({ task, members, user, setView, onPass }: { task: Task | null, members: Member[], user: Member, setView: (v: View) => void, onPass: (taskId: string, toUserId: string, fine: number) => void }) {
   const [step, setStep] = useState<'select' | 'payment' | 'success'>('select');
   const [selectedMember, setSelectedMember] = useState<Member | null>(null);
   const [paymentMethod, setPaymentMethod] = useState<'nequi' | 'efectivo'>('nequi');
@@ -2085,9 +3386,10 @@ function PassTaskScreen({ task, setView }: { task: Task | null, setView: (v: Vie
 
   if (!task) return null;
 
-  const otherMembers = MEMBERS.filter(m => m.id !== '3'); // Filter out current user (Leo)
+  const otherMembers = members.filter(m => m.id !== user.id);
   const penaltyMultiplier = task.penaltyMultiplier || 1;
-  const finalFine = task.fine * penaltyMultiplier;
+  const baseFine = task.passCost || task.fine;
+  const finalFine = baseFine * penaltyMultiplier;
 
   if (step === 'success') {
     return (
@@ -2189,7 +3491,7 @@ function PassTaskScreen({ task, setView }: { task: Task | null, setView: (v: Vie
           onClose={() => setIsConfirmModalOpen(false)}
           onConfirm={() => {
             setIsConfirmModalOpen(false);
-            setStep('success');
+            onPass(task.id, selectedMember?.id || '', finalFine);
           }}
           title="¿Confirmar traspaso?"
           message={`Se transferirá la tarea a ${selectedMember?.name} por $${finalFine.toLocaleString()}.`}
@@ -2257,6 +3559,7 @@ function CreateTaskScreen({ members, setView, onSave, darkMode }: { members: Mem
   const [xp, setXp] = useState(50);
   const [fine, setFine] = useState(5000);
   const [value, setValue] = useState(5000);
+  const [passCost, setPassCost] = useState(5000);
   const [category, setCategory] = useState('General');
   const [taskType, setTaskType] = useState<'duty' | 'obligation'>('duty');
   const [selectedIcon, setSelectedIcon] = useState('Utensils');
@@ -2272,6 +3575,7 @@ function CreateTaskScreen({ members, setView, onSave, darkMode }: { members: Mem
       xp,
       fine,
       value,
+      passCost,
       status: 'pending',
       icon: selectedIcon,
       category,
@@ -2385,6 +3689,15 @@ function CreateTaskScreen({ members, setView, onSave, darkMode }: { members: Mem
               className={`w-full p-4 rounded-xl border-2 outline-none focus:border-primary transition-all ${darkMode ? 'bg-slate-800 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900 shadow-sm'}`}
             />
           </div>
+          <div className="space-y-2">
+            <label className="text-xs font-black uppercase tracking-widest text-slate-400">Costo Traspaso ($)</label>
+            <input 
+              type="number" 
+              value={passCost}
+              onChange={(e) => setPassCost(Number(e.target.value))}
+              className={`w-full p-4 rounded-xl border-2 outline-none focus:border-primary transition-all ${darkMode ? 'bg-slate-800 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900 shadow-sm'}`}
+            />
+          </div>
         </div>
 
         <div className="space-y-2">
@@ -2420,7 +3733,9 @@ function ProfileScreen({ user, onUpdateUser, setView, onLogout, currentUser }: {
   const [isEditing, setIsEditing] = useState(false);
   const [name, setName] = useState(user.name);
   const [avatar, setAvatar] = useState(user.avatar);
+  const [xp, setXp] = useState(user.xp);
   const [debt, setDebt] = useState(user.debt);
+  const [monthlyDebt, setMonthlyDebt] = useState(user.monthlyDebt || 0);
   const [paymentType, setPaymentType] = useState<'nequi' | 'bancolombia'>(user.paymentInfo?.type || 'nequi');
   const [paymentNumber, setPaymentNumber] = useState(user.paymentInfo?.number || '');
   const [darkMode, setDarkMode] = useState(user.settings?.darkMode || false);
@@ -2443,12 +3758,14 @@ function ProfileScreen({ user, onUpdateUser, setView, onLogout, currentUser }: {
       ...user,
       name,
       avatar,
+      xp,
       paymentInfo: {
         type: paymentType,
         number: paymentNumber
       },
       availability,
       debt,
+      monthlyDebt,
       settings: {
         darkMode
       }
@@ -2504,11 +3821,28 @@ function ProfileScreen({ user, onUpdateUser, setView, onLogout, currentUser }: {
                   <RefreshCw size={16} />
                 </button>
                 <button 
-                  onClick={() => fileInputRef.current?.click()}
+                  onClick={() => {
+                    if (fileInputRef.current) {
+                      fileInputRef.current.setAttribute('capture', 'environment');
+                      fileInputRef.current.click();
+                    }
+                  }}
                   className="bg-blue-500 text-white p-2 rounded-full border-2 border-white dark:border-slate-900 shadow-lg hover:scale-110 transition-transform"
-                  title="Subir Foto"
+                  title="Cámara"
                 >
                   <Camera size={16} />
+                </button>
+                <button 
+                  onClick={() => {
+                    if (fileInputRef.current) {
+                      fileInputRef.current.removeAttribute('capture');
+                      fileInputRef.current.click();
+                    }
+                  }}
+                  className="bg-emerald-500 text-white p-2 rounded-full border-2 border-white dark:border-slate-900 shadow-lg hover:scale-110 transition-transform"
+                  title="Galería"
+                >
+                  <ImageIcon size={16} />
                 </button>
                 <input 
                   type="file" 
@@ -2532,10 +3866,17 @@ function ProfileScreen({ user, onUpdateUser, setView, onLogout, currentUser }: {
               <>
                 <h2 className="text-2xl font-black text-slate-800 dark:text-white">{user.name}</h2>
                 <p className="text-primary font-bold">Nivel {user.level} • {user.xp} XP</p>
-                <div className="mt-2 inline-block px-4 py-1 bg-slate-100 dark:bg-slate-800 rounded-full border-2 border-slate-200 dark:border-slate-700">
-                  <p className={`text-xs font-black uppercase tracking-widest ${user.debt < 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
-                    Deuda: ${user.debt.toLocaleString()}
-                  </p>
+                <div className="mt-2 flex flex-wrap justify-center gap-2">
+                  <div className="px-4 py-1 bg-slate-100 dark:bg-slate-800 rounded-full border-2 border-slate-200 dark:border-slate-700">
+                    <p className={`text-[10px] font-black uppercase tracking-widest ${user.debt < 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
+                      Semanal: ${user.debt.toLocaleString()}
+                    </p>
+                  </div>
+                  <div className="px-4 py-1 bg-slate-100 dark:bg-slate-800 rounded-full border-2 border-slate-200 dark:border-slate-700">
+                    <p className={`text-[10px] font-black uppercase tracking-widest ${user.monthlyDebt < 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
+                      Mensual: ${(user.monthlyDebt || 0).toLocaleString()}
+                    </p>
+                  </div>
                 </div>
               </>
             )}
@@ -2554,6 +3895,15 @@ function ProfileScreen({ user, onUpdateUser, setView, onLogout, currentUser }: {
                 type="number" 
                 value={debt}
                 onChange={(e) => setDebt(Number(e.target.value))}
+                className="w-full bg-slate-50 dark:bg-slate-900 border-2 border-slate-100 dark:border-slate-800 rounded-xl px-4 py-3 font-bold text-slate-700 dark:text-slate-300 focus:border-primary outline-none transition-all"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-[10px] font-black text-slate-400 uppercase ml-1">Experiencia (XP)</label>
+              <input 
+                type="number" 
+                value={xp}
+                onChange={(e) => setXp(Number(e.target.value))}
                 className="w-full bg-slate-50 dark:bg-slate-900 border-2 border-slate-100 dark:border-slate-800 rounded-xl px-4 py-3 font-bold text-slate-700 dark:text-slate-300 focus:border-primary outline-none transition-all"
               />
             </div>
